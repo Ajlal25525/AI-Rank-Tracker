@@ -50,10 +50,16 @@ def get_root_domain(url_or_domain):
 
 
 def domain_matches(link, target_domain):
+    """Strict exact-match.
+
+    The tool intentionally does NOT match subdomains or parents. If the user enters
+    `agtech.folio3.com`, only URLs on that exact host count. To track multiple
+    subdomains, enter each one separately.
+    """
     result_domain = get_root_domain(link)
     if not result_domain or not target_domain:
         return False
-    return result_domain == target_domain or result_domain.endswith("." + target_domain)
+    return result_domain == target_domain
 
 
 def determine_page_type(url):
@@ -73,7 +79,6 @@ def determine_page_type(url):
 
 
 def google_verify_url(keyword, gl="us"):
-    """Build a personalization-disabled Google search URL for manual verification."""
     return f"https://www.google.com/search?q={quote_plus(keyword)}&gl={gl}&pws=0&num=20"
 
 
@@ -121,11 +126,7 @@ def _fetch_page(keyword, page, api_key, gl, hl, location, device):
 
 
 def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, max_pages=10):
-    """Walk SERP pages 1..max_pages collecting organic results.
-
-    Pagination with num=10 reliably reaches positions 30-100 — Serper's num=100
-    is unreliable when location is set. Stops early once the target domain is found.
-    """
+    """Walk SERP pages 1..max_pages collecting organic results."""
     all_organic = []
     first_page_payload = None
     rank_counter = 0
@@ -150,7 +151,9 @@ def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, m
         for item in organic:
             rank_counter += 1
             link = item.get("link", "")
-            position = item.get("position") or rank_counter
+            # Always use the cumulative counter so position reflects exactly what
+            # the user would see scrolling the SERP top-to-bottom.
+            position = rank_counter
             entry = {
                 "position": position, "url": link,
                 "title": item.get("title", ""), "snippet": item.get("snippet", ""),
@@ -202,7 +205,6 @@ def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, m
 
 
 def render_styling():
-    """Theme-aware CSS — adapts to light + dark themes via Streamlit CSS variables."""
     st.markdown(
         """
         <style>
@@ -219,10 +221,8 @@ def render_styling():
 
         .kpi-card {
             background: var(--secondary-background-color, #f8fafc);
-            padding: 18px 22px;
-            border-radius: 12px;
-            border: 1px solid rgba(127, 127, 127, 0.18);
-            height: 100%;
+            padding: 18px 22px; border-radius: 12px;
+            border: 1px solid rgba(127, 127, 127, 0.18); height: 100%;
         }
         .kpi-label {
             font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
@@ -237,10 +237,6 @@ def render_styling():
             font-size: 12px; color: var(--text-color, #6b7280);
             opacity: 0.6; margin-top: 4px;
         }
-        .kpi-up   { color: #10b981; font-weight: 700; }
-        .kpi-down { color: #ef4444; font-weight: 700; }
-        .kpi-flat { opacity: 0.6; font-weight: 700; }
-
         .live-dot {
             display:inline-block; width:8px; height:8px; border-radius:50%;
             background:#10b981; margin-right:6px; animation: pulse 1.5s infinite;
@@ -287,8 +283,6 @@ def run_tracking(keywords, target_domain, api_key, gl, hl, location, device, max
     progress_text = st.empty()
     progress_bar = st.progress(0)
 
-    previous = {row["Keyword"]: row.get("Position") for row in st.session_state.get("results_data", [])}
-    st.session_state.previous_ranks = previous
     rows = []
     cache = {}
 
@@ -345,9 +339,13 @@ def render_sidebar():
             "Target Domain",
             placeholder="yourdomain.com",
             value=st.session_state.domain,
-            help="Enter the domain you want to track. Use the root (example.com) to also "
-                 "match subdomains, or a specific subdomain (shop.example.com) for an exact match.",
+            help="Enter the EXACT host you want to track. Strict match — `agtech.folio3.com` "
+                 "will not match `folio3.com` or `blog.folio3.com`. To track several "
+                 "subdomains, enter each one separately on different scans.",
         )
+        if target_domain:
+            resolved = get_root_domain(target_domain)
+            st.caption(f"🎯 Strict match against: **`{resolved}`** (and `www.` variant)")
         serper_key = st.text_input("Serper.dev API Key", type="password")
 
         with st.expander("🌍 SERP Targeting", expanded=True):
@@ -359,7 +357,7 @@ def render_sidebar():
                 options=["Top 10", "Top 30", "Top 50", "Top 100"],
                 value="Top 100",
                 help="How deep to scan the SERP. Top 100 paginates up to 10 pages "
-                     "(stops early when your domain is found). Use Top 30 for faster, cheaper scans.",
+                     "(stops early when your domain is found).",
             )
             depth_map = {"Top 10": 1, "Top 30": 3, "Top 50": 5, "Top 100": 10}
             max_pages = depth_map[depth_label]
@@ -425,8 +423,8 @@ def render_dashboard(df_res):
     if total_kw > 0 and top_100 == 0 and (df_res["Results Found"] > 0).any():
         st.warning(
             "⚠️ **None of your keywords ranked in the top 100, but Serper IS returning results.** "
-            "Open the **SERP Inspector** tab to see who's actually ranking, "
-            "or use the **🔗 Verify in Google** link to double-check."
+            "Open the **SERP Inspector** tab to see who's ranking, "
+            "or click **🔗 open** on any row to verify in Google directly."
         )
 
     c1, c2, c3, c4 = st.columns(4)
@@ -440,8 +438,7 @@ def render_dashboard(df_res):
 
     st.markdown("##### Ranking Distribution")
     dist = {
-        "1-3": top_3,
-        "4-10": top_10 - top_3,
+        "1-3": top_3, "4-10": top_10 - top_3,
         "11-20": top_20 - top_10,
         "21-50": sum(1 for p in all_pos if 20 < p <= 50),
         "51-100": sum(1 for p in all_pos if 50 < p <= 100),
@@ -512,7 +509,7 @@ def render_intelligence(df_res):
             ),
             "Verify": st.column_config.LinkColumn(
                 "Verify in Google",
-                help="Open this keyword in Google US with personalization disabled — compare against the rank shown.",
+                help="Open this keyword in Google US with personalization disabled.",
                 display_text="🔗 open",
             ),
         },
@@ -521,13 +518,12 @@ def render_intelligence(df_res):
     with st.expander("ℹ️ Why does my Google search look different?"):
         st.markdown(
             "- **Organic-only positions.** Featured snippets, ads, and PAA boxes are excluded "
-            "from the rank — what's shown is your true *organic* SERP position. "
-            "This is the same metric Ahrefs and Semrush use.\n"
-            "- **No personalization.** Serper queries a generic Google US — your browser "
-            "personalizes results based on history, location, and account. Click "
-            "**🔗 Verify in Google** to open the same query with `pws=0` (no personalization).\n"
-            "- **Caching.** Serper.dev caches SERPs for ~1 hour. Run the scan again later "
-            "if you need a fresher snapshot."
+            "from the rank — same metric Ahrefs and Semrush use.\n"
+            "- **Strict host match.** Only your exact domain is matched. `agtech.folio3.com` "
+            "will never be conflated with `folio3.com` or `blog.folio3.com`.\n"
+            "- **No personalization.** Click **🔗 open** on a row to compare the ranking against "
+            "Google US with `pws=0` set.\n"
+            "- **Caching.** Serper.dev caches SERPs for ~1 hour. Re-run the scan for a fresher snapshot."
         )
 
 
