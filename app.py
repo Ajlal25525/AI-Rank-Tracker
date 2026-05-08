@@ -82,27 +82,12 @@ def google_verify_url(keyword, gl="us"):
     return f"https://www.google.com/search?q={quote_plus(keyword)}&gl={gl}&pws=0&num=20"
 
 
-def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, depth=100):
-    """Fetch the SERP in a single request with num=depth for accurate ranking.
-
-    Pagination (page=1, page=2, …) drifts from the real SERP because Google
-    re-ranks/dedupes between pages. A single num=100 request returns the actual
-    top-N organic list. We also trust Serper's own `position` field for each
-    organic entry.
-    """
+def _post_serper(body, api_key):
     headers = {"X-API-KEY": api_key, "Content-Type": "application/json"}
-    body = {
-        "q": keyword, "gl": gl, "hl": hl,
-        "num": depth, "device": device, "autocorrect": False,
-    }
-    if location:
-        body["location"] = location
-
     last_err = None
-    payload = None
     for attempt in range(3):
         try:
-            r = requests.post(SERPER_ENDPOINT, headers=headers, data=json.dumps(body), timeout=30)
+            r = requests.post(SERPER_ENDPOINT, headers=headers, data=json.dumps(body), timeout=25)
             if r.status_code in (401, 403):
                 return {"error": "API Key Error", "msg": "Unauthorized — check your Serper.dev API key."}
             if r.status_code in (402, 429):
@@ -111,28 +96,63 @@ def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, d
                 last_err = f"HTTP {r.status_code}: {r.text[:200]}"
                 time.sleep(1.5 * (attempt + 1))
                 continue
-            payload = r.json()
-            break
+            return {"payload": r.json()}
         except requests.RequestException as e:
             last_err = str(e)
             time.sleep(1.5 * (attempt + 1))
+    return {"error": "Network Error", "msg": last_err or "Unknown error"}
 
-    if payload is None:
-        return {"error": "Network Error", "msg": last_err or "Unknown error"}
 
-    organic = payload.get("organic", []) or []
+def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, depth=100):
+    """Walk Google SERP page-by-page (num=10) up to `depth` results.
+
+    Google deprecated the `num=` query parameter in late 2025 — requesting
+    `num=100` no longer reliably returns 100 results. The supported path is
+    paginated `page=1..N` with `num=10`, which we accumulate into a single
+    ordered list. We use a global counter as the rank (1-indexed across pages)
+    and stop early when the target domain is found to save API credits.
+    """
+    pages_needed = max(1, (depth + 9) // 10)
+
     all_organic = []
+    rank_counter = 0
     matches = []
-    for idx, item in enumerate(organic, start=1):
-        link = item.get("link", "")
-        position = item.get("position") or idx
-        entry = {
-            "position": position, "url": link,
-            "title": item.get("title", ""), "snippet": item.get("snippet", ""),
+
+    for page in range(1, pages_needed + 1):
+        body = {
+            "q": keyword, "gl": gl, "hl": hl,
+            "num": 10, "page": page, "device": device, "autocorrect": False,
         }
-        all_organic.append(entry)
-        if domain_matches(link, target_domain):
-            matches.append(entry)
+        if location:
+            body["location"] = location
+
+        res = _post_serper(body, api_key)
+        if "error" in res:
+            if all_organic:
+                break
+            return res
+
+        organic = res["payload"].get("organic", []) or []
+        if not organic:
+            break
+
+        for item in organic:
+            rank_counter += 1
+            link = item.get("link", "")
+            entry = {
+                "position": rank_counter, "url": link,
+                "title": item.get("title", ""), "snippet": item.get("snippet", ""),
+            }
+            all_organic.append(entry)
+            if domain_matches(link, target_domain):
+                matches.append(entry)
+
+        if matches:
+            break
+        if len(organic) < 10:
+            break
+        if page < pages_needed:
+            time.sleep(0.5)
 
     top_competitors = [
         {
@@ -314,8 +334,8 @@ def render_sidebar():
                 "Tracking Depth",
                 options=["Top 10", "Top 20", "Top 30", "Top 50", "Top 100"],
                 value="Top 100",
-                help="How many results to fetch in a single Serper call. Single-call "
-                     "fetch (num=N) is more accurate than paginated fetches.",
+                help="How deep to scan the SERP. Walks page=1..N (num=10 each) and "
+                     "stops early once your domain is found, to save API credits.",
             )
             depth_map = {"Top 10": 10, "Top 20": 20, "Top 30": 30, "Top 50": 50, "Top 100": 100}
             depth = depth_map[depth_label]
@@ -473,8 +493,9 @@ def render_intelligence(df_res):
             "from the rank — same metric Ahrefs and Semrush use.\n"
             "- **Subdomain-tolerant match.** Entering `folio3.com` also captures hits on "
             "`agtech.folio3.com`, `blog.folio3.com`, etc. Enter a specific subdomain to narrow.\n"
-            "- **Single-call SERP fetch.** We request `num=N` in one call (no pagination drift) "
-            "and use Serper's own organic position field.\n"
+            "- **Paginated SERP walk.** Google deprecated `num=100`, so we walk "
+            "`page=1..N` with `num=10` and accumulate a single ordered list — that "
+            "matches what you see scrolling Google page by page.\n"
             "- **Caching.** Serper.dev caches SERPs briefly. Re-run the scan for a fresher snapshot."
         )
 
