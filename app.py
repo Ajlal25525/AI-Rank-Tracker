@@ -50,16 +50,21 @@ def get_root_domain(url_or_domain):
 
 
 def domain_matches(link, target_domain):
-    """Match if the result is on the target domain OR a subdomain of it.
+    """Strict exact-host match.
 
-    - Enter `folio3.com` → matches `folio3.com`, `agtech.folio3.com`, `blog.folio3.com`.
-    - Enter `agtech.folio3.com` → matches that host and any deeper subdomain;
-      will NOT match `folio3.com` (parent) or sibling subdomains like `blog.folio3.com`.
+    Only the exact host the user entered counts (the `www.` prefix is normalized
+    away by get_root_domain, so `www.folio3.com` and `folio3.com` are treated as
+    the same host).
+
+    - Enter `folio3.com` → matches ONLY `folio3.com` (not `agtech.folio3.com`,
+      not `blog.folio3.com`).
+    - Enter `agtech.folio3.com` → matches ONLY `agtech.folio3.com` (not the
+      parent `folio3.com`, not sibling subdomains).
     """
     result_domain = get_root_domain(link)
     if not result_domain or not target_domain:
         return False
-    return result_domain == target_domain or result_domain.endswith("." + target_domain)
+    return result_domain == target_domain
 
 
 def determine_page_type(url):
@@ -314,16 +319,17 @@ def render_sidebar():
         st.markdown("### ⚙️ Tracker Configuration")
         target_domain = st.text_input(
             "Target Domain",
-            placeholder="yourdomain.com",
+            placeholder="yourdomain.com  or  sub.yourdomain.com",
             value=st.session_state.domain,
-            help="Enter your domain. Matching is subdomain-tolerant: `folio3.com` "
-                 "matches `agtech.folio3.com` and `blog.folio3.com` too. "
-                 "Enter a specific subdomain (e.g. `agtech.folio3.com`) to restrict "
-                 "matches to that host.",
+            help="Enter the EXACT host you want to track. Strict match only — "
+                 "`folio3.com` will NOT match `agtech.folio3.com`, and "
+                 "`agtech.folio3.com` will NOT match `folio3.com` or "
+                 "`blog.folio3.com`. To track multiple subdomains, scan each "
+                 "one separately.",
         )
         if target_domain:
             resolved = get_root_domain(target_domain)
-            st.caption(f"🎯 Matches **`{resolved}`** and its subdomains")
+            st.caption(f"🎯 Strict exact match: **`{resolved}`** only")
         serper_key = st.text_input("Serper.dev API Key", type="password")
 
         with st.expander("🌍 SERP Targeting", expanded=True):
@@ -491,8 +497,9 @@ def render_intelligence(df_res):
         st.markdown(
             "- **Organic-only positions.** Featured snippets, ads, and PAA boxes are excluded "
             "from the rank — same metric Ahrefs and Semrush use.\n"
-            "- **Subdomain-tolerant match.** Entering `folio3.com` also captures hits on "
-            "`agtech.folio3.com`, `blog.folio3.com`, etc. Enter a specific subdomain to narrow.\n"
+            "- **Strict host match.** Only the exact host you entered counts. "
+            "`folio3.com` will not match `agtech.folio3.com`; `agtech.folio3.com` "
+            "will not match `folio3.com` or `blog.folio3.com`.\n"
             "- **Paginated SERP walk.** Google deprecated `num=100`, so we walk "
             "`page=1..N` with `num=10` and accumulate a single ordered list — that "
             "matches what you see scrolling Google page by page.\n"
