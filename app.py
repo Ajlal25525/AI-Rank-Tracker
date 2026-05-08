@@ -56,20 +56,6 @@ def domain_matches(link, target_domain):
     return result_domain == target_domain or result_domain.endswith("." + target_domain)
 
 
-def determine_page_type(url):
-    if not url or url == "N/A":
-        return "N/A"
-    u = url.lower()
-    path = urlparse(u).path
-    if any(kw in path for kw in ["/blog", "/article", "/post", "/news", "/insights"]):
-        return "Blog"
-    if any(kw in path for kw in ["/product", "/services", "/solutions", "/pricing", "/features"]):
-        return "Product"
-    if path in ("", "/"):
-        return "Homepage"
-    return "Landing Page"
-
-
 def detect_serp_features(payload):
     feature_map = [
         ("answerBox", "Featured Snippet"),
@@ -85,16 +71,10 @@ def detect_serp_features(payload):
 
 
 def _fetch_page(keyword, page, api_key, gl, hl, location, device):
-    """Fetch a single SERP page (10 results) from Serper.dev with retries."""
     headers = {"X-API-KEY": api_key, "Content-Type": "application/json"}
     body = {
-        "q": keyword,
-        "gl": gl,
-        "hl": hl,
-        "num": 10,
-        "page": page,
-        "device": device,
-        "autocorrect": False,
+        "q": keyword, "gl": gl, "hl": hl,
+        "num": 10, "page": page, "device": device, "autocorrect": False,
     }
     if location:
         body["location"] = location
@@ -122,10 +102,9 @@ def _fetch_page(keyword, page, api_key, gl, hl, location, device):
 def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, max_pages=10):
     """Walk SERP pages 1..max_pages collecting organic results.
 
-    Why pagination: Serper.dev's `num=100` is unreliable when `location` is set —
-    Google often returns only 20-40 organic results per call. Paginating with
-    num=10 reliably reaches positions 30-100 where most non-top-10 keywords sit.
-    Stops early once the target domain is found.
+    Pagination with num=10 reliably reaches positions 30-100 — Serper's num=100
+    is unreliable when location is set (Google often returns only 20-40 results
+    in a single call). Stops early once the target domain is found.
     """
     all_organic = []
     first_page_payload = None
@@ -153,10 +132,8 @@ def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, m
             link = item.get("link", "")
             position = item.get("position") or rank_counter
             entry = {
-                "position": position,
-                "url": link,
-                "title": item.get("title", ""),
-                "snippet": item.get("snippet", ""),
+                "position": position, "url": link,
+                "title": item.get("title", ""), "snippet": item.get("snippet", ""),
             }
             all_organic.append(entry)
 
@@ -197,44 +174,64 @@ def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, m
         }
 
     return {
-        "rank": None,
-        "url": "N/A",
-        "title": "",
-        "all_matches": [],
-        "features": features,
+        "rank": None, "url": "N/A", "title": "",
+        "all_matches": [], "features": features,
         "top_competitors": top_competitors,
         "results_count": len(all_organic),
     }
 
 
 def render_styling():
+    """Theme-aware CSS — adapts to light + dark themes via Streamlit CSS variables."""
     st.markdown(
         """
         <style>
-        .block-container { padding-top: 2rem; padding-bottom: 2rem; max-width: 1400px; }
-        .stTabs [data-baseweb="tab-list"] { gap: 8px; border-bottom: 1px solid #2D333B; }
+        .block-container { padding-top: 2.2rem; padding-bottom: 2rem; max-width: 1400px; }
+        h1 { letter-spacing: -0.02em; font-weight: 800; }
+
+        .stTabs [data-baseweb="tab-list"] { gap: 4px; }
         .stTabs [data-baseweb="tab"] {
-            height: 44px; background: transparent; border-radius: 8px 8px 0 0;
-            padding: 0 18px; font-size: 14px; font-weight: 600; color: #8B949E;
+            height: 44px; padding: 0 18px;
+            font-size: 14px; font-weight: 600;
+            border-radius: 8px 8px 0 0;
         }
-        .stTabs [aria-selected="true"] { color: #FFFFFF; background: rgba(59,130,246,0.08); }
+        .stTabs [aria-selected="true"] { background: rgba(59,130,246,0.08); }
+
         .kpi-card {
-            background: linear-gradient(180deg, #161A25 0%, #131722 100%);
-            padding: 18px 20px; border-radius: 14px; border: 1px solid #2D333B;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.2); height: 100%;
+            background: var(--secondary-background-color, #f8fafc);
+            padding: 18px 22px;
+            border-radius: 12px;
+            border: 1px solid rgba(127, 127, 127, 0.18);
+            height: 100%;
         }
-        .kpi-label { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #8B949E; font-weight: 700; }
-        .kpi-value { font-size: 1.9rem; font-weight: 800; color: #FFFFFF; margin-top: 6px; line-height: 1.1; }
-        .kpi-sub { font-size: 12px; color: #6E7681; margin-top: 4px; }
+        .kpi-label {
+            font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
+            color: var(--text-color, #6b7280); opacity: 0.7; font-weight: 700;
+        }
+        .kpi-value {
+            font-size: 1.85rem; font-weight: 800;
+            color: var(--text-color, #111827);
+            margin-top: 6px; line-height: 1.1;
+        }
+        .kpi-sub {
+            font-size: 12px; color: var(--text-color, #6b7280);
+            opacity: 0.6; margin-top: 4px;
+        }
         .kpi-up   { color: #10b981; font-weight: 700; }
         .kpi-down { color: #ef4444; font-weight: 700; }
-        .kpi-flat { color: #8B949E; font-weight: 700; }
-        .live-dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#10b981; margin-right:6px; animation: pulse 1.5s infinite; }
+        .kpi-flat { opacity: 0.6; font-weight: 700; }
+
+        .live-dot {
+            display:inline-block; width:8px; height:8px; border-radius:50%;
+            background:#10b981; margin-right:6px; animation: pulse 1.5s infinite;
+            vertical-align: middle;
+        }
         @keyframes pulse {
-            0% { box-shadow: 0 0 0 0 rgba(16,185,129,0.6); }
-            70% { box-shadow: 0 0 0 8px rgba(16,185,129,0); }
+            0%   { box-shadow: 0 0 0 0 rgba(16,185,129,0.55); }
+            70%  { box-shadow: 0 0 0 8px rgba(16,185,129,0); }
             100% { box-shadow: 0 0 0 0 rgba(16,185,129,0); }
         }
+        section[data-testid="stSidebar"] h3 { letter-spacing: -0.01em; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -314,9 +311,7 @@ def run_tracking(keywords, target_domain, api_key, gl, hl, location, device, max
             "Position": position,
             "URL": url,
             "Title": res.get("title", ""),
-            "Page Type": determine_page_type(url),
             "SERP Features": ", ".join(res.get("features", [])) or "—",
-            "Cannibalization": len(res.get("all_matches", [])),
             "Top Result": top_result,
             "Results Found": res.get("results_count", 0),
         })
@@ -341,10 +336,10 @@ def render_sidebar():
         st.markdown("### ⚙️ Tracker Configuration")
         target_domain = st.text_input(
             "Target Domain",
-            placeholder="agtech.folio3.com",
+            placeholder="yourdomain.com",
             value=st.session_state.domain,
-            help="Enter the exact domain or subdomain. Use the parent domain (folio3.com) "
-                 "to also match subdomains; use the subdomain (agtech.folio3.com) for exact match.",
+            help="Enter the domain you want to track. Use the root (example.com) to also "
+                 "match subdomains, or a specific subdomain (shop.example.com) for an exact match.",
         )
         serper_key = st.text_input("Serper.dev API Key", type="password")
 
@@ -456,63 +451,48 @@ def render_dashboard(df_res):
 
     st.markdown("####")
 
-    g1, g2 = st.columns([2, 1])
-    with g1:
-        st.markdown("##### Ranking Distribution")
-        dist = {
-            "1-3": top_3,
-            "4-10": top_10 - top_3,
-            "11-20": top_20 - top_10,
-            "21-50": sum(1 for p in all_pos if 20 < p <= 50),
-            "51-100": sum(1 for p in all_pos if 50 < p <= 100),
-            "Not Ranked": total_kw - top_100,
-        }
-        bar_df = pd.DataFrame(list(dist.items()), columns=["Range", "Count"])
-        fig = px.bar(
-            bar_df, x="Range", y="Count", color="Range", text="Count",
-            color_discrete_sequence=["#10b981", "#34d399", "#fbbf24", "#f59e0b", "#ef4444", "#4b5563"],
-            template="plotly_dark",
-        )
-        fig.update_traces(textposition="outside")
-        fig.update_layout(showlegend=False, margin=dict(l=0, r=0, t=20, b=0),
-                          plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-                          xaxis_title="", yaxis_title="")
-        st.plotly_chart(fig, use_container_width=True)
-
-    with g2:
-        st.markdown("##### Page Type Mix")
-        pt = df_res[df_res["Page Type"] != "N/A"]["Page Type"].value_counts().reset_index()
-        pt.columns = ["Page Type", "Count"]
-        if not pt.empty:
-            fig_pie = px.pie(pt, values="Count", names="Page Type", hole=0.65, template="plotly_dark",
-                             color_discrete_sequence=["#3b82f6", "#8b5cf6", "#ec4899", "#06b6d4"])
-            fig_pie.update_layout(showlegend=True, margin=dict(l=0, r=0, t=20, b=0),
-                                  plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-                                  legend=dict(orientation="h", y=-0.1))
-            st.plotly_chart(fig_pie, use_container_width=True)
-        else:
-            st.info("No ranked pages yet — check the SERP Inspector tab.")
+    st.markdown("##### Ranking Distribution")
+    dist = {
+        "1-3": top_3,
+        "4-10": top_10 - top_3,
+        "11-20": top_20 - top_10,
+        "21-50": sum(1 for p in all_pos if 20 < p <= 50),
+        "51-100": sum(1 for p in all_pos if 50 < p <= 100),
+        "Not Ranked": total_kw - top_100,
+    }
+    bar_df = pd.DataFrame(list(dist.items()), columns=["Range", "Count"])
+    fig = px.bar(
+        bar_df, x="Range", y="Count", color="Range", text="Count",
+        color_discrete_sequence=["#10b981", "#34d399", "#fbbf24", "#f59e0b", "#ef4444", "#9ca3af"],
+    )
+    fig.update_traces(textposition="outside")
+    fig.update_layout(
+        showlegend=False, margin=dict(l=0, r=0, t=10, b=0), height=320,
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        xaxis_title="", yaxis_title="",
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
     opps = df_res[(df_res["Position"] >= 4) & (df_res["Position"] <= 20)].sort_values("Position")
     if not opps.empty:
-        st.markdown("##### 🎯 Quick-Win Opportunities (positions 4–20)")
-        st.caption("Close to page-1 / top-3 — prioritize internal linking and on-page optimization here.")
+        st.markdown("##### 🎯 Quick-Win Opportunities")
+        st.caption("Keywords ranking in positions 4–20 — closest to page-1 / top-3.")
         st.dataframe(
-            opps[["Keyword", "Rank", "URL", "Page Type", "SERP Features"]],
-            use_container_width=True, hide_index=True, height=min(300, 45 + 35 * len(opps)),
+            opps[["Keyword", "Rank", "URL", "SERP Features"]],
+            use_container_width=True, hide_index=True,
+            height=min(320, 45 + 38 * len(opps)),
+            column_config={"URL": st.column_config.LinkColumn("URL", width="medium")},
         )
 
 
 def render_intelligence(df_res):
     st.markdown("##### 🔍 Keyword Intelligence")
 
-    col_a, col_b, col_c = st.columns([2, 1, 1])
+    col_a, col_b = st.columns([3, 1])
     with col_a:
-        search = st.text_input("Search keywords", placeholder="filter by keyword or URL...", label_visibility="collapsed")
+        search = st.text_input("Search keywords", placeholder="Filter by keyword or URL…", label_visibility="collapsed")
     with col_b:
-        rank_filter = st.selectbox("Position", ["All", "Top 3", "Top 10", "Top 20", "21-100", "Not Ranked"])
-    with col_c:
-        page_filter = st.selectbox("Page Type", ["All"] + sorted(df_res["Page Type"].unique().tolist()))
+        rank_filter = st.selectbox("Position", ["All", "Top 3", "Top 10", "Top 20", "21–100", "Not Ranked"])
 
     df = df_res.copy()
     if search:
@@ -524,12 +504,10 @@ def render_intelligence(df_res):
         df = df[df["Position"] <= 10]
     elif rank_filter == "Top 20":
         df = df[df["Position"] <= 20]
-    elif rank_filter == "21-100":
+    elif rank_filter == "21–100":
         df = df[(df["Position"] > 20) & (df["Position"] <= 100)]
     elif rank_filter == "Not Ranked":
         df = df[df["Position"] > 100]
-    if page_filter != "All":
-        df = df[df["Page Type"] == page_filter]
 
     prev = st.session_state.get("previous_ranks") or {}
     df["Δ"] = df.apply(
@@ -540,8 +518,10 @@ def render_intelligence(df_res):
         axis=1,
     )
 
-    display_cols = ["Keyword", "Rank", "Δ", "URL", "Page Type", "SERP Features", "Cannibalization", "Top Result"]
-    df_show = df[display_cols].sort_values("Rank", key=lambda s: s.map(lambda v: int(v) if str(v).isdigit() else 999))
+    display_cols = ["Keyword", "Rank", "Δ", "URL", "SERP Features", "Top Result"]
+    df_show = df[display_cols].sort_values(
+        "Rank", key=lambda s: s.map(lambda v: int(v) if str(v).isdigit() else 999)
+    )
 
     st.caption(f"Showing **{len(df_show)}** of {len(df_res)} keywords")
     styled = df_show.style.map(rank_color, subset=["Rank"])
@@ -551,9 +531,6 @@ def render_intelligence(df_res):
             "URL": st.column_config.LinkColumn("URL", width="medium"),
             "Top Result": st.column_config.TextColumn(
                 "Top Result", help="The #1 ranking domain in Google for this keyword."
-            ),
-            "Cannibalization": st.column_config.NumberColumn(
-                "Cannibalization", help="URLs from your domain ranking for this keyword. >1 indicates content overlap."
             ),
         },
     )
@@ -641,8 +618,8 @@ def main():
 
     st.markdown(
         "<h1 style='margin-bottom:0'>🎯 SERP Tracker Pro</h1>"
-        "<p style='color:#8B949E; margin-top:4px'>"
-        "<span class='live-dot'></span>Real-time Google rank tracking · powered by Serper.dev"
+        "<p style='opacity:0.65; margin-top:4px; font-size:0.95rem;'>"
+        "<span class='live-dot'></span>Real-time Google rank tracking"
         "</p>",
         unsafe_allow_html=True,
     )
