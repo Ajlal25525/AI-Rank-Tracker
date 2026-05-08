@@ -82,33 +82,27 @@ def google_verify_url(keyword, gl="us"):
     return f"https://www.google.com/search?q={quote_plus(keyword)}&gl={gl}&pws=0&num=20"
 
 
-def detect_serp_features(payload):
-    feature_map = [
-        ("answerBox", "Featured Snippet"),
-        ("knowledgeGraph", "Knowledge Graph"),
-        ("peopleAlsoAsk", "People Also Ask"),
-        ("relatedSearches", "Related Searches"),
-        ("images", "Images"),
-        ("videos", "Videos"),
-        ("topStories", "Top Stories"),
-        ("shopping", "Shopping"),
-    ]
-    return [label for key, label in feature_map if key in payload]
+def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, depth=100):
+    """Fetch the SERP in a single request with num=depth for accurate ranking.
 
-
-def _fetch_page(keyword, page, api_key, gl, hl, location, device):
+    Pagination (page=1, page=2, …) drifts from the real SERP because Google
+    re-ranks/dedupes between pages. A single num=100 request returns the actual
+    top-N organic list. We also trust Serper's own `position` field for each
+    organic entry.
+    """
     headers = {"X-API-KEY": api_key, "Content-Type": "application/json"}
     body = {
         "q": keyword, "gl": gl, "hl": hl,
-        "num": 10, "page": page, "device": device, "autocorrect": False,
+        "num": depth, "device": device, "autocorrect": False,
     }
     if location:
         body["location"] = location
 
     last_err = None
+    payload = None
     for attempt in range(3):
         try:
-            r = requests.post(SERPER_ENDPOINT, headers=headers, data=json.dumps(body), timeout=20)
+            r = requests.post(SERPER_ENDPOINT, headers=headers, data=json.dumps(body), timeout=30)
             if r.status_code in (401, 403):
                 return {"error": "API Key Error", "msg": "Unauthorized — check your Serper.dev API key."}
             if r.status_code in (402, 429):
@@ -117,62 +111,28 @@ def _fetch_page(keyword, page, api_key, gl, hl, location, device):
                 last_err = f"HTTP {r.status_code}: {r.text[:200]}"
                 time.sleep(1.5 * (attempt + 1))
                 continue
-            return {"payload": r.json()}
+            payload = r.json()
+            break
         except requests.RequestException as e:
             last_err = str(e)
             time.sleep(1.5 * (attempt + 1))
 
-    return {"error": "Network Error", "msg": last_err or "Unknown error"}
+    if payload is None:
+        return {"error": "Network Error", "msg": last_err or "Unknown error"}
 
-
-def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, max_pages=10):
-    """Walk SERP pages 1..max_pages collecting organic results."""
+    organic = payload.get("organic", []) or []
     all_organic = []
-    first_page_payload = None
-    rank_counter = 0
     matches = []
-    target_position = None
-
-    for page in range(1, max_pages + 1):
-        res = _fetch_page(keyword, page, api_key, gl, hl, location, device)
-        if "error" in res:
-            if all_organic:
-                break
-            return res
-
-        payload = res["payload"]
-        if page == 1:
-            first_page_payload = payload
-
-        organic = payload.get("organic", []) or []
-        if not organic:
-            break
-
-        for item in organic:
-            rank_counter += 1
-            link = item.get("link", "")
-            # Always use the cumulative counter so position reflects exactly what
-            # the user would see scrolling the SERP top-to-bottom.
-            position = rank_counter
-            entry = {
-                "position": position, "url": link,
-                "title": item.get("title", ""), "snippet": item.get("snippet", ""),
-            }
-            all_organic.append(entry)
-
-            if domain_matches(link, target_domain):
-                matches.append(entry)
-                if target_position is None:
-                    target_position = position
-
-        if target_position is not None:
-            break
-        if len(organic) < 10:
-            break
-        if page < max_pages:
-            time.sleep(0.3)
-
-    features = detect_serp_features(first_page_payload or {})
+    for idx, item in enumerate(organic, start=1):
+        link = item.get("link", "")
+        position = item.get("position") or idx
+        entry = {
+            "position": position, "url": link,
+            "title": item.get("title", ""), "snippet": item.get("snippet", ""),
+        }
+        all_organic.append(entry)
+        if domain_matches(link, target_domain):
+            matches.append(entry)
 
     top_competitors = [
         {
@@ -185,20 +145,19 @@ def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, m
     ]
 
     if matches:
-        best = matches[0]
+        best = min(matches, key=lambda e: e["position"])
         return {
             "rank": best["position"],
             "url": best["url"],
             "title": best["title"],
             "all_matches": matches,
-            "features": features,
             "top_competitors": top_competitors,
             "results_count": len(all_organic),
         }
 
     return {
         "rank": None, "url": "N/A", "title": "",
-        "all_matches": [], "features": features,
+        "all_matches": [],
         "top_competitors": top_competitors,
         "results_count": len(all_organic),
     }
@@ -278,7 +237,7 @@ def kpi_card(label, value, sub_html=""):
     return f'<div class="kpi-card"><div class="kpi-label">{label}</div><div class="kpi-value">{value}</div>{sub}</div>'
 
 
-def run_tracking(keywords, target_domain, api_key, gl, hl, location, device, max_pages=10):
+def run_tracking(keywords, target_domain, api_key, gl, hl, location, device, depth=100):
     root = get_root_domain(target_domain)
     progress_text = st.empty()
     progress_bar = st.progress(0)
@@ -291,7 +250,7 @@ def run_tracking(keywords, target_domain, api_key, gl, hl, location, device, max
             f"<span class='live-dot'></span>**Scanning** `{kw}`  · {i+1}/{len(keywords)}",
             unsafe_allow_html=True,
         )
-        res = analyze_keyword(kw, root, api_key, gl, hl, location, device, max_pages=max_pages)
+        res = analyze_keyword(kw, root, api_key, gl, hl, location, device, depth=depth)
 
         if "error" in res:
             st.error(f"{res['error']}: {res['msg']}")
@@ -299,8 +258,8 @@ def run_tracking(keywords, target_domain, api_key, gl, hl, location, device, max
 
         rank = res.get("rank")
         url = res.get("url", "N/A")
-        position = rank if isinstance(rank, int) else 101
-        display_rank = str(rank) if isinstance(rank, int) else "Not in Top 100"
+        position = rank if isinstance(rank, int) else depth + 1
+        display_rank = str(rank) if isinstance(rank, int) else f"Not in Top {depth}"
         top_competitors = res.get("top_competitors", [])
         top_result = top_competitors[0]["domain"] if top_competitors else "—"
 
@@ -311,9 +270,7 @@ def run_tracking(keywords, target_domain, api_key, gl, hl, location, device, max
             "URL": url,
             "Title": res.get("title", ""),
             "Page Type": determine_page_type(url),
-            "SERP Features": ", ".join(res.get("features", [])) or "—",
             "Top Result": top_result,
-            "Verify": google_verify_url(kw, gl),
             "Results Found": res.get("results_count", 0),
         })
         cache[kw] = top_competitors
@@ -354,13 +311,13 @@ def render_sidebar():
             device = st.selectbox("Device", ["desktop", "mobile"], index=0)
             depth_label = st.select_slider(
                 "Tracking Depth",
-                options=["Top 10", "Top 30", "Top 50", "Top 100"],
+                options=["Top 10", "Top 20", "Top 30", "Top 50", "Top 100"],
                 value="Top 100",
-                help="How deep to scan the SERP. Top 100 paginates up to 10 pages "
-                     "(stops early when your domain is found).",
+                help="How many results to fetch in a single Serper call. Single-call "
+                     "fetch (num=N) is more accurate than paginated fetches.",
             )
-            depth_map = {"Top 10": 1, "Top 30": 3, "Top 50": 5, "Top 100": 10}
-            max_pages = depth_map[depth_label]
+            depth_map = {"Top 10": 10, "Top 20": 20, "Top 30": 30, "Top 50": 50, "Top 100": 100}
+            depth = depth_map[depth_label]
 
         st.divider()
         st.markdown("### 📥 Keywords")
@@ -403,7 +360,7 @@ def render_sidebar():
             "hl": preset["hl"],
             "location": preset["location"],
             "device": device,
-            "max_pages": max_pages,
+            "depth": depth,
             "keywords": keywords,
             "run_btn": run_btn,
         }
@@ -423,8 +380,7 @@ def render_dashboard(df_res):
     if total_kw > 0 and top_100 == 0 and (df_res["Results Found"] > 0).any():
         st.warning(
             "⚠️ **None of your keywords ranked in the top 100, but Serper IS returning results.** "
-            "Open the **SERP Inspector** tab to see who's ranking, "
-            "or click **🔗 open** on any row to verify in Google directly."
+            "Open the **SERP Inspector** tab to see who's ranking for each keyword."
         )
 
     c1, c2, c3, c4 = st.columns(4)
@@ -462,7 +418,7 @@ def render_dashboard(df_res):
         st.markdown("##### 🎯 Quick-Win Opportunities")
         st.caption("Keywords ranking in positions 4–20 — closest to page-1 / top-3.")
         st.dataframe(
-            opps[["Keyword", "Rank", "URL", "Page Type", "SERP Features"]],
+            opps[["Keyword", "Rank", "URL", "Page Type", "Top Result"]],
             use_container_width=True, hide_index=True,
             height=min(320, 45 + 38 * len(opps)),
             column_config={"URL": st.column_config.LinkColumn("URL", width="medium")},
@@ -493,7 +449,7 @@ def render_intelligence(df_res):
     elif rank_filter == "Not Ranked":
         df = df[df["Position"] > 100]
 
-    display_cols = ["Keyword", "Rank", "URL", "Page Type", "SERP Features", "Top Result", "Verify"]
+    display_cols = ["Keyword", "Rank", "URL", "Page Type", "Top Result"]
     df_show = df[display_cols].sort_values(
         "Rank", key=lambda s: s.map(lambda v: int(v) if str(v).isdigit() else 999)
     )
@@ -507,11 +463,6 @@ def render_intelligence(df_res):
             "Top Result": st.column_config.TextColumn(
                 "Top Result", help="The #1 ranking domain in Google for this keyword."
             ),
-            "Verify": st.column_config.LinkColumn(
-                "Verify in Google",
-                help="Open this keyword in Google US with personalization disabled.",
-                display_text="🔗 open",
-            ),
         },
     )
 
@@ -521,9 +472,9 @@ def render_intelligence(df_res):
             "from the rank — same metric Ahrefs and Semrush use.\n"
             "- **Strict host match.** Only your exact domain is matched. `agtech.folio3.com` "
             "will never be conflated with `folio3.com` or `blog.folio3.com`.\n"
-            "- **No personalization.** Click **🔗 open** on a row to compare the ranking against "
-            "Google US with `pws=0` set.\n"
-            "- **Caching.** Serper.dev caches SERPs for ~1 hour. Re-run the scan for a fresher snapshot."
+            "- **Single-call SERP fetch.** We request `num=N` in one call (no pagination drift) "
+            "and use Serper's own organic position field.\n"
+            "- **Caching.** Serper.dev caches SERPs briefly. Re-run the scan for a fresher snapshot."
         )
 
 
@@ -576,19 +527,12 @@ def render_serp_inspector(df_res):
 def render_exports(df_res):
     st.markdown("##### 📑 Export & Share")
     csv = df_res.drop(columns=["Position", "Results Found"], errors="ignore").to_csv(index=False).encode("utf-8")
-    json_bytes = df_res.to_json(orient="records", indent=2).encode("utf-8")
 
-    c1, c2 = st.columns(2)
     domain_slug = st.session_state.domain.replace(".", "_") or "report"
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
-    with c1:
-        st.download_button("📥 CSV Report", data=csv,
-                           file_name=f"{domain_slug}_rankings_{stamp}.csv",
-                           mime="text/csv", type="primary", use_container_width=True)
-    with c2:
-        st.download_button("📥 JSON Report", data=json_bytes,
-                           file_name=f"{domain_slug}_rankings_{stamp}.json",
-                           mime="application/json", use_container_width=True)
+    st.download_button("📥 CSV Report", data=csv,
+                       file_name=f"{domain_slug}_rankings_{stamp}.csv",
+                       mime="text/csv", type="primary", use_container_width=False)
 
 
 def main():
@@ -618,7 +562,7 @@ def main():
             run_tracking(
                 cfg["keywords"], cfg["target_domain"], cfg["serper_key"],
                 cfg["gl"], cfg["hl"], cfg["location"], cfg["device"],
-                max_pages=cfg["max_pages"],
+                depth=cfg["depth"],
             )
 
     tab1, tab2, tab3, tab4 = st.tabs(["📊 Dashboard", "🔍 Keyword Intelligence", "🔬 SERP Inspector", "📑 Export"])
