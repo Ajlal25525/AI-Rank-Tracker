@@ -84,14 +84,15 @@ def detect_serp_features(payload):
     return [label for key, label in feature_map if key in payload]
 
 
-def fetch_serp(keyword, api_key, gl, hl, location, device, num=100):
-    """Single Serper.dev call returning top-N organic results plus SERP features."""
+def _fetch_page(keyword, page, api_key, gl, hl, location, device):
+    """Fetch a single SERP page (10 results) from Serper.dev with retries."""
     headers = {"X-API-KEY": api_key, "Content-Type": "application/json"}
     body = {
         "q": keyword,
         "gl": gl,
         "hl": hl,
-        "num": num,
+        "num": 10,
+        "page": page,
         "device": device,
         "autocorrect": False,
     }
@@ -118,35 +119,69 @@ def fetch_serp(keyword, api_key, gl, hl, location, device, num=100):
     return {"error": "Network Error", "msg": last_err or "Unknown error"}
 
 
-def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device):
-    res = fetch_serp(keyword, api_key, gl, hl, location, device, num=100)
-    if "error" in res:
-        return res
+def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, max_pages=10):
+    """Walk SERP pages 1..max_pages collecting organic results.
 
-    payload = res["payload"]
-    organic = payload.get("organic", []) or []
-    features = detect_serp_features(payload)
-
+    Why pagination: Serper.dev's `num=100` is unreliable when `location` is set —
+    Google often returns only 20-40 organic results per call. Paginating with
+    num=10 reliably reaches positions 30-100 where most non-top-10 keywords sit.
+    Stops early once the target domain is found.
+    """
+    all_organic = []
+    first_page_payload = None
+    rank_counter = 0
     matches = []
-    for idx, item in enumerate(organic, start=1):
-        link = item.get("link", "")
-        position = item.get("position", idx)
-        if domain_matches(link, target_domain):
-            matches.append({
+    target_position = None
+
+    for page in range(1, max_pages + 1):
+        res = _fetch_page(keyword, page, api_key, gl, hl, location, device)
+        if "error" in res:
+            if all_organic:
+                break
+            return res
+
+        payload = res["payload"]
+        if page == 1:
+            first_page_payload = payload
+
+        organic = payload.get("organic", []) or []
+        if not organic:
+            break
+
+        for item in organic:
+            rank_counter += 1
+            link = item.get("link", "")
+            position = item.get("position") or rank_counter
+            entry = {
                 "position": position,
                 "url": link,
                 "title": item.get("title", ""),
                 "snippet": item.get("snippet", ""),
-            })
+            }
+            all_organic.append(entry)
+
+            if domain_matches(link, target_domain):
+                matches.append(entry)
+                if target_position is None:
+                    target_position = position
+
+        if target_position is not None:
+            break
+        if len(organic) < 10:
+            break
+        if page < max_pages:
+            time.sleep(0.3)
+
+    features = detect_serp_features(first_page_payload or {})
 
     top_competitors = [
         {
-            "position": item.get("position", i + 1),
-            "domain": get_root_domain(item.get("link", "")),
-            "url": item.get("link", ""),
-            "title": item.get("title", ""),
+            "position": e["position"],
+            "domain": get_root_domain(e["url"]),
+            "url": e["url"],
+            "title": e["title"],
         }
-        for i, item in enumerate(organic[:10])
+        for e in all_organic[:10]
     ]
 
     if matches:
@@ -158,7 +193,7 @@ def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device):
             "all_matches": matches,
             "features": features,
             "top_competitors": top_competitors,
-            "results_count": len(organic),
+            "results_count": len(all_organic),
         }
 
     return {
@@ -168,7 +203,7 @@ def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device):
         "all_matches": [],
         "features": features,
         "top_competitors": top_competitors,
-        "results_count": len(organic),
+        "results_count": len(all_organic),
     }
 
 
@@ -188,19 +223,13 @@ def render_styling():
             padding: 18px 20px; border-radius: 14px; border: 1px solid #2D333B;
             box-shadow: 0 1px 3px rgba(0,0,0,0.2); height: 100%;
         }
-        .kpi-label {
-            font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
-            color: #8B949E; font-weight: 700;
-        }
+        .kpi-label { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #8B949E; font-weight: 700; }
         .kpi-value { font-size: 1.9rem; font-weight: 800; color: #FFFFFF; margin-top: 6px; line-height: 1.1; }
         .kpi-sub { font-size: 12px; color: #6E7681; margin-top: 4px; }
         .kpi-up   { color: #10b981; font-weight: 700; }
         .kpi-down { color: #ef4444; font-weight: 700; }
         .kpi-flat { color: #8B949E; font-weight: 700; }
-        .live-dot {
-            display:inline-block; width:8px; height:8px; border-radius:50%;
-            background:#10b981; margin-right:6px; animation: pulse 1.5s infinite;
-        }
+        .live-dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#10b981; margin-right:6px; animation: pulse 1.5s infinite; }
         @keyframes pulse {
             0% { box-shadow: 0 0 0 0 rgba(16,185,129,0.6); }
             70% { box-shadow: 0 0 0 8px rgba(16,185,129,0); }
@@ -251,7 +280,7 @@ def kpi_card(label, value, sub_html=""):
     return f'<div class="kpi-card"><div class="kpi-label">{label}</div><div class="kpi-value">{value}</div>{sub}</div>'
 
 
-def run_tracking(keywords, target_domain, api_key, gl, hl, location, device):
+def run_tracking(keywords, target_domain, api_key, gl, hl, location, device, max_pages=10):
     root = get_root_domain(target_domain)
     progress_text = st.empty()
     progress_bar = st.progress(0)
@@ -266,7 +295,7 @@ def run_tracking(keywords, target_domain, api_key, gl, hl, location, device):
             f"<span class='live-dot'></span>**Scanning** `{kw}`  · {i+1}/{len(keywords)}",
             unsafe_allow_html=True,
         )
-        res = analyze_keyword(kw, root, api_key, gl, hl, location, device)
+        res = analyze_keyword(kw, root, api_key, gl, hl, location, device, max_pages=max_pages)
 
         if "error" in res:
             st.error(f"{res['error']}: {res['msg']}")
@@ -323,6 +352,15 @@ def render_sidebar():
             country = st.selectbox("Country / Location", list(LOCATION_PRESETS.keys()), index=0)
             preset = LOCATION_PRESETS[country]
             device = st.selectbox("Device", ["desktop", "mobile"], index=0)
+            depth_label = st.select_slider(
+                "Tracking Depth",
+                options=["Top 10", "Top 30", "Top 50", "Top 100"],
+                value="Top 100",
+                help="How deep to scan the SERP. Top 100 paginates up to 10 pages "
+                     "(stops early when your domain is found). Use Top 30 for faster, cheaper scans.",
+            )
+            depth_map = {"Top 10": 1, "Top 30": 3, "Top 50": 5, "Top 100": 10}
+            max_pages = depth_map[depth_label]
 
         st.divider()
         st.markdown("### 📥 Keywords")
@@ -365,6 +403,7 @@ def render_sidebar():
             "hl": preset["hl"],
             "location": preset["location"],
             "device": device,
+            "max_pages": max_pages,
             "keywords": keywords,
             "run_btn": run_btn,
         }
@@ -511,7 +550,7 @@ def render_intelligence(df_res):
         column_config={
             "URL": st.column_config.LinkColumn("URL", width="medium"),
             "Top Result": st.column_config.TextColumn(
-                "Top Result", help="The #1 ranking domain in Google for this keyword. If empty, the API returned no results."
+                "Top Result", help="The #1 ranking domain in Google for this keyword."
             ),
             "Cannibalization": st.column_config.NumberColumn(
                 "Cannibalization", help="URLs from your domain ranking for this keyword. >1 indicates content overlap."
@@ -622,6 +661,7 @@ def main():
             run_tracking(
                 cfg["keywords"], cfg["target_domain"], cfg["serper_key"],
                 cfg["gl"], cfg["hl"], cfg["location"], cfg["device"],
+                max_pages=cfg["max_pages"],
             )
 
     tab1, tab2, tab3, tab4 = st.tabs(["📊 Dashboard", "🔍 Keyword Intelligence", "🔬 SERP Inspector", "📑 Export"])
