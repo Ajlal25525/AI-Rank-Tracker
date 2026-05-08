@@ -11,19 +11,15 @@ import plotly.express as px
 SERPER_ENDPOINT = "https://google.serper.dev/search"
 
 LOCATION_PRESETS = {
-    "United States (New York)": {"gl": "us", "hl": "en", "location": "New York, New York, United States"},
-    "United States (Los Angeles)": {"gl": "us", "hl": "en", "location": "Los Angeles, California, United States"},
-    "United States (Chicago)": {"gl": "us", "hl": "en", "location": "Chicago, Illinois, United States"},
-    "United States (Dallas)": {"gl": "us", "hl": "en", "location": "Dallas, Texas, United States"},
-    "United States (country-wide)": {"gl": "us", "hl": "en", "location": "United States"},
-    "United Kingdom": {"gl": "uk", "hl": "en", "location": "London, England, United Kingdom"},
-    "Canada": {"gl": "ca", "hl": "en", "location": "Toronto, Ontario, Canada"},
-    "Australia": {"gl": "au", "hl": "en", "location": "Sydney, New South Wales, Australia"},
-    "India": {"gl": "in", "hl": "en", "location": "Mumbai, Maharashtra, India"},
-    "Pakistan": {"gl": "pk", "hl": "en", "location": "Karachi, Sindh, Pakistan"},
-    "Germany": {"gl": "de", "hl": "de", "location": "Berlin, Germany"},
-    "France": {"gl": "fr", "hl": "fr", "location": "Paris, France"},
-    "Spain": {"gl": "es", "hl": "es", "location": "Madrid, Spain"},
+    "United States": {"gl": "us", "hl": "en"},
+    "United Kingdom": {"gl": "uk", "hl": "en"},
+    "Canada": {"gl": "ca", "hl": "en"},
+    "Australia": {"gl": "au", "hl": "en"},
+    "India": {"gl": "in", "hl": "en"},
+    "Pakistan": {"gl": "pk", "hl": "en"},
+    "Germany": {"gl": "de", "hl": "de"},
+    "France": {"gl": "fr", "hl": "fr"},
+    "Spain": {"gl": "es", "hl": "es"},
 }
 
 
@@ -123,9 +119,12 @@ def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, d
     matches = []
 
     for page in range(1, pages_needed + 1):
+        # Mirror what a generic user in this country sees: country-level gl + hl,
+        # no `location` hint unless the user explicitly opted in, no autocorrect
+        # override (let Google use its default query understanding).
         body = {
             "q": keyword, "gl": gl, "hl": hl,
-            "num": 10, "page": page, "device": device, "autocorrect": False,
+            "num": 10, "page": page, "device": device,
         }
         if location:
             body["location"] = location
@@ -334,16 +333,17 @@ def render_sidebar():
         serper_key = st.text_input("Serper.dev API Key", type="password")
 
         with st.expander("🌍 SERP Targeting", expanded=True):
-            country = st.selectbox("Country / Location", list(LOCATION_PRESETS.keys()), index=0)
+            country = st.selectbox("Country", list(LOCATION_PRESETS.keys()), index=0)
             preset = LOCATION_PRESETS[country]
             custom_location = st.text_input(
-                "Custom Location (optional)",
+                "City-level Location (optional)",
                 placeholder="e.g. Austin, Texas, United States",
-                help="Override the preset above with any Serper-supported location "
-                     "string. Use this to match the city your VPN exits from for "
-                     "the most consistent results.",
+                help="Leave blank for the broad, country-level view that any "
+                     "generic user in this country sees on Google. Fill in a "
+                     "city only if you want results geo-targeted to that "
+                     "specific city (matches a VPN exiting from that city).",
             )
-            location = custom_location.strip() or preset["location"]
+            location = custom_location.strip()
             device = st.selectbox("Device", ["desktop", "mobile"], index=0)
             depth_label = st.select_slider(
                 "Tracking Depth",
@@ -354,7 +354,10 @@ def render_sidebar():
             )
             depth_map = {"Top 10": 10, "Top 20": 20, "Top 30": 30, "Top 50": 50, "Top 100": 100}
             depth = depth_map[depth_label]
-            st.caption(f"📍 Searching from: **{location}**")
+            if location:
+                st.caption(f"📍 Targeting: **{location}**")
+            else:
+                st.caption(f"📍 Country-level **{country}** (gl={preset['gl']}, hl={preset['hl']})")
 
         st.divider()
         st.markdown("### 📥 Keywords")
@@ -503,22 +506,19 @@ def render_intelligence(df_res):
         },
     )
 
-    with st.expander("ℹ️ Why don't tool ranks exactly match my VPN check?"):
+    with st.expander("ℹ️ How are these ranks computed?"):
         st.markdown(
-            "Google rankings are **not deterministic**. Two clean searches "
-            "for the same keyword from different US cities, or even minutes apart, "
-            "routinely differ by 5–20 positions. Reasons:\n\n"
-            "- **City-level geo-targeting.** Google personalizes by city, not just country. "
-            "Your VPN exits from a specific city; pick a matching city in **SERP Targeting** "
-            "(or paste an exact location in the Custom Location box) for the closest match.\n"
-            "- **Time-of-query churn.** Google updates its index continuously and runs "
-            "live A/B tests. Same query 5 minutes apart can return different ranks.\n"
-            "- **Strict host match.** Only the exact host you entered counts — "
-            "`folio3.com` won't match `agtech.folio3.com` and vice versa.\n"
-            "- **Authoritative position.** We use Serper's `position` field (Google's actual "
-            "organic position), so featured snippets, ads, and PAA boxes don't shift the rank.\n"
-            "- **Paginated walk.** Since Google deprecated `num=100`, we walk `page=1..N` "
-            "with `num=10` to reach pages 2–10."
+            "We mirror what a generic user in the selected country sees on Google:\n\n"
+            "- **Country-level only by default** (`gl=us`, `hl=en`). No `location` "
+            "hint, no autocorrect override — the broadest, most user-like SERP. "
+            "Add a city in **SERP Targeting → City-level Location** only if you "
+            "want results geo-targeted to a specific city.\n"
+            "- **Authoritative position.** We use Serper's `position` field — "
+            "Google's actual organic rank — so featured snippets, ads, and PAA "
+            "boxes don't shift the number.\n"
+            "- **Strict host match.** Only the exact host you entered counts.\n"
+            "- **Paginated walk.** Google deprecated `num=100`, so we walk "
+            "`page=1..N` with `num=10` and accumulate the full top-100 list."
         )
 
 
