@@ -4,7 +4,7 @@ import requests
 import json
 import time
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
 import plotly.express as px
 
 
@@ -56,6 +56,27 @@ def domain_matches(link, target_domain):
     return result_domain == target_domain or result_domain.endswith("." + target_domain)
 
 
+def determine_page_type(url):
+    """Classify a URL into Blog / Product / Homepage / Landing Page."""
+    if not url or url == "N/A":
+        return "N/A"
+    path = urlparse(url.lower()).path
+    blog_markers = ["/blog", "/article", "/post", "/news", "/insights",
+                    "/resources/blog", "/learn", "/guides", "/case-stud"]
+    if any(m in path for m in blog_markers):
+        return "Blog"
+    if any(m in path for m in ["/product", "/services", "/solutions", "/pricing", "/features"]):
+        return "Product"
+    if path in ("", "/"):
+        return "Homepage"
+    return "Landing Page"
+
+
+def google_verify_url(keyword, gl="us"):
+    """Build a personalization-disabled Google search URL for manual verification."""
+    return f"https://www.google.com/search?q={quote_plus(keyword)}&gl={gl}&pws=0&num=20"
+
+
 def detect_serp_features(payload):
     feature_map = [
         ("answerBox", "Featured Snippet"),
@@ -103,8 +124,7 @@ def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, m
     """Walk SERP pages 1..max_pages collecting organic results.
 
     Pagination with num=10 reliably reaches positions 30-100 — Serper's num=100
-    is unreliable when location is set (Google often returns only 20-40 results
-    in a single call). Stops early once the target domain is found.
+    is unreliable when location is set. Stops early once the target domain is found.
     """
     all_organic = []
     first_page_payload = None
@@ -257,21 +277,6 @@ def rank_color(val):
         return ""
 
 
-def delta_str(curr, prev):
-    if prev is None or curr is None:
-        return "—", "kpi-flat"
-    try:
-        c = int(curr); p = int(prev)
-    except (ValueError, TypeError):
-        return "—", "kpi-flat"
-    diff = p - c
-    if diff > 0:
-        return f"▲ {diff}", "kpi-up"
-    if diff < 0:
-        return f"▼ {abs(diff)}", "kpi-down"
-    return "= 0", "kpi-flat"
-
-
 def kpi_card(label, value, sub_html=""):
     sub = f'<div class="kpi-sub">{sub_html}</div>' if sub_html else ""
     return f'<div class="kpi-card"><div class="kpi-label">{label}</div><div class="kpi-value">{value}</div>{sub}</div>'
@@ -311,8 +316,10 @@ def run_tracking(keywords, target_domain, api_key, gl, hl, location, device, max
             "Position": position,
             "URL": url,
             "Title": res.get("title", ""),
+            "Page Type": determine_page_type(url),
             "SERP Features": ", ".join(res.get("features", [])) or "—",
             "Top Result": top_result,
+            "Verify": google_verify_url(kw, gl),
             "Results Found": res.get("results_count", 0),
         })
         cache[kw] = top_competitors
@@ -418,36 +425,16 @@ def render_dashboard(df_res):
     if total_kw > 0 and top_100 == 0 and (df_res["Results Found"] > 0).any():
         st.warning(
             "⚠️ **None of your keywords ranked in the top 100, but Serper IS returning results.** "
-            "This usually means: (a) your domain truly doesn't rank for these terms in the selected location, "
-            "or (b) you entered the wrong domain/subdomain. Open the **SERP Inspector** tab and pick any "
-            "keyword to see who's actually ranking — verify whether your site is there at all."
+            "Open the **SERP Inspector** tab to see who's actually ranking, "
+            "or use the **🔗 Verify in Google** link to double-check."
         )
 
-    prev = st.session_state.get("previous_ranks") or {}
-    improved = declined = unchanged = 0
-    for _, row in df_res.iterrows():
-        p = prev.get(row["Keyword"])
-        if p is None:
-            continue
-        if row["Position"] < p:
-            improved += 1
-        elif row["Position"] > p:
-            declined += 1
-        else:
-            unchanged += 1
-
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4 = st.columns(4)
     c1.markdown(kpi_card("Visibility Index", f"{visibility}%", f"{top_10}/{total_kw} in top 10"), unsafe_allow_html=True)
     c2.markdown(kpi_card("Top 3", str(top_3), "premium positions"), unsafe_allow_html=True)
     c3.markdown(kpi_card("Top 10", str(top_10), f"{top_20} in top 20"), unsafe_allow_html=True)
     c4.markdown(kpi_card("Avg Position", f"{avg_pos:.1f}" if avg_pos is not None else "—",
                          f"{len(ranked)} ranked of {total_kw}"), unsafe_allow_html=True)
-    movement_html = (
-        f'<span class="kpi-up">▲ {improved}</span> &nbsp; '
-        f'<span class="kpi-down">▼ {declined}</span> &nbsp; '
-        f'<span class="kpi-flat">= {unchanged}</span>'
-    )
-    c5.markdown(kpi_card("Movement", f"{improved + declined + unchanged}", movement_html), unsafe_allow_html=True)
 
     st.markdown("####")
 
@@ -478,7 +465,7 @@ def render_dashboard(df_res):
         st.markdown("##### 🎯 Quick-Win Opportunities")
         st.caption("Keywords ranking in positions 4–20 — closest to page-1 / top-3.")
         st.dataframe(
-            opps[["Keyword", "Rank", "URL", "SERP Features"]],
+            opps[["Keyword", "Rank", "URL", "Page Type", "SERP Features"]],
             use_container_width=True, hide_index=True,
             height=min(320, 45 + 38 * len(opps)),
             column_config={"URL": st.column_config.LinkColumn("URL", width="medium")},
@@ -509,16 +496,7 @@ def render_intelligence(df_res):
     elif rank_filter == "Not Ranked":
         df = df[df["Position"] > 100]
 
-    prev = st.session_state.get("previous_ranks") or {}
-    df["Δ"] = df.apply(
-        lambda r: delta_str(
-            r["Position"] if r["Position"] <= 100 else None,
-            prev.get(r["Keyword"]) if (prev.get(r["Keyword"]) or 999) <= 100 else None,
-        )[0],
-        axis=1,
-    )
-
-    display_cols = ["Keyword", "Rank", "Δ", "URL", "SERP Features", "Top Result"]
+    display_cols = ["Keyword", "Rank", "URL", "Page Type", "SERP Features", "Top Result", "Verify"]
     df_show = df[display_cols].sort_values(
         "Rank", key=lambda s: s.map(lambda v: int(v) if str(v).isdigit() else 999)
     )
@@ -528,17 +506,34 @@ def render_intelligence(df_res):
     st.dataframe(
         styled, use_container_width=True, hide_index=True, height=560,
         column_config={
-            "URL": st.column_config.LinkColumn("URL", width="medium"),
+            "URL": st.column_config.LinkColumn("Your URL", width="medium"),
             "Top Result": st.column_config.TextColumn(
                 "Top Result", help="The #1 ranking domain in Google for this keyword."
+            ),
+            "Verify": st.column_config.LinkColumn(
+                "Verify in Google",
+                help="Open this keyword in Google US with personalization disabled — compare against the rank shown.",
+                display_text="🔗 open",
             ),
         },
     )
 
+    with st.expander("ℹ️ Why does my Google search look different?"):
+        st.markdown(
+            "- **Organic-only positions.** Featured snippets, ads, and PAA boxes are excluded "
+            "from the rank — what's shown is your true *organic* SERP position. "
+            "This is the same metric Ahrefs and Semrush use.\n"
+            "- **No personalization.** Serper queries a generic Google US — your browser "
+            "personalizes results based on history, location, and account. Click "
+            "**🔗 Verify in Google** to open the same query with `pws=0` (no personalization).\n"
+            "- **Caching.** Serper.dev caches SERPs for ~1 hour. Run the scan again later "
+            "if you need a fresher snapshot."
+        )
+
 
 def render_serp_inspector(df_res):
     st.markdown("##### 🔬 SERP Inspector")
-    st.caption("Pick any keyword to see Google's actual top 10 results. Use this to verify whether your domain is really missing from the SERP, or if you entered the wrong domain.")
+    st.caption("Pick any keyword to see Google's actual top 10 results.")
 
     cache = st.session_state.get("serp_cache") or {}
     if not cache:
@@ -574,12 +569,10 @@ def render_serp_inspector(df_res):
         column_config={"URL": st.column_config.LinkColumn("URL", width="medium")},
     )
 
+    st.link_button("🔗 Verify this SERP on Google", google_verify_url(keyword), use_container_width=False)
+
     if target and not found_target:
-        st.info(
-            f"`{target}` is **not in the top 10** for this keyword. It may rank lower (positions 11–100), "
-            "or not rank at all in the selected country/device. Use the position filter on the Intelligence "
-            "tab to confirm."
-        )
+        st.info(f"`{target}` is **not in the top 10** for this keyword.")
     elif found_target:
         st.success(f"✓ `{target}` appears in the top 10 for this keyword.")
 
@@ -600,15 +593,6 @@ def render_exports(df_res):
         st.download_button("📥 JSON Report", data=json_bytes,
                            file_name=f"{domain_slug}_rankings_{stamp}.json",
                            mime="application/json", use_container_width=True)
-
-    st.divider()
-    st.markdown("##### Run Summary")
-    st.json({
-        "domain": st.session_state.domain,
-        "keywords_tracked": len(df_res),
-        "last_run_at": st.session_state.last_run_at,
-        "ranked_in_top_100": int((df_res["Position"] <= 100).sum()),
-    })
 
 
 def main():
