@@ -50,16 +50,16 @@ def get_root_domain(url_or_domain):
 
 
 def domain_matches(link, target_domain):
-    """Strict exact-match.
+    """Match if the result is on the target domain OR a subdomain of it.
 
-    The tool intentionally does NOT match subdomains or parents. If the user enters
-    `agtech.folio3.com`, only URLs on that exact host count. To track multiple
-    subdomains, enter each one separately.
+    - Enter `folio3.com` → matches `folio3.com`, `agtech.folio3.com`, `blog.folio3.com`.
+    - Enter `agtech.folio3.com` → matches that host and any deeper subdomain;
+      will NOT match `folio3.com` (parent) or sibling subdomains like `blog.folio3.com`.
     """
     result_domain = get_root_domain(link)
     if not result_domain or not target_domain:
         return False
-    return result_domain == target_domain
+    return result_domain == target_domain or result_domain.endswith("." + target_domain)
 
 
 def determine_page_type(url):
@@ -296,13 +296,14 @@ def render_sidebar():
             "Target Domain",
             placeholder="yourdomain.com",
             value=st.session_state.domain,
-            help="Enter the EXACT host you want to track. Strict match — `agtech.folio3.com` "
-                 "will not match `folio3.com` or `blog.folio3.com`. To track several "
-                 "subdomains, enter each one separately on different scans.",
+            help="Enter your domain. Matching is subdomain-tolerant: `folio3.com` "
+                 "matches `agtech.folio3.com` and `blog.folio3.com` too. "
+                 "Enter a specific subdomain (e.g. `agtech.folio3.com`) to restrict "
+                 "matches to that host.",
         )
         if target_domain:
             resolved = get_root_domain(target_domain)
-            st.caption(f"🎯 Strict match against: **`{resolved}`** (and `www.` variant)")
+            st.caption(f"🎯 Matches **`{resolved}`** and its subdomains")
         serper_key = st.text_input("Serper.dev API Key", type="password")
 
         with st.expander("🌍 SERP Targeting", expanded=True):
@@ -470,8 +471,8 @@ def render_intelligence(df_res):
         st.markdown(
             "- **Organic-only positions.** Featured snippets, ads, and PAA boxes are excluded "
             "from the rank — same metric Ahrefs and Semrush use.\n"
-            "- **Strict host match.** Only your exact domain is matched. `agtech.folio3.com` "
-            "will never be conflated with `folio3.com` or `blog.folio3.com`.\n"
+            "- **Subdomain-tolerant match.** Entering `folio3.com` also captures hits on "
+            "`agtech.folio3.com`, `blog.folio3.com`, etc. Enter a specific subdomain to narrow.\n"
             "- **Single-call SERP fetch.** We request `num=N` in one call (no pagination drift) "
             "and use Serper's own organic position field.\n"
             "- **Caching.** Serper.dev caches SERPs briefly. Re-run the scan for a fresher snapshot."
