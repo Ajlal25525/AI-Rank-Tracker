@@ -11,15 +11,19 @@ import plotly.express as px
 SERPER_ENDPOINT = "https://google.serper.dev/search"
 
 LOCATION_PRESETS = {
-    "United States": {"gl": "us", "hl": "en", "location": "United States"},
-    "United Kingdom": {"gl": "uk", "hl": "en", "location": "United Kingdom"},
-    "Canada": {"gl": "ca", "hl": "en", "location": "Canada"},
-    "Australia": {"gl": "au", "hl": "en", "location": "Australia"},
-    "India": {"gl": "in", "hl": "en", "location": "India"},
-    "Pakistan": {"gl": "pk", "hl": "en", "location": "Pakistan"},
-    "Germany": {"gl": "de", "hl": "de", "location": "Germany"},
-    "France": {"gl": "fr", "hl": "fr", "location": "France"},
-    "Spain": {"gl": "es", "hl": "es", "location": "Spain"},
+    "United States (New York)": {"gl": "us", "hl": "en", "location": "New York, New York, United States"},
+    "United States (Los Angeles)": {"gl": "us", "hl": "en", "location": "Los Angeles, California, United States"},
+    "United States (Chicago)": {"gl": "us", "hl": "en", "location": "Chicago, Illinois, United States"},
+    "United States (Dallas)": {"gl": "us", "hl": "en", "location": "Dallas, Texas, United States"},
+    "United States (country-wide)": {"gl": "us", "hl": "en", "location": "United States"},
+    "United Kingdom": {"gl": "uk", "hl": "en", "location": "London, England, United Kingdom"},
+    "Canada": {"gl": "ca", "hl": "en", "location": "Toronto, Ontario, Canada"},
+    "Australia": {"gl": "au", "hl": "en", "location": "Sydney, New South Wales, Australia"},
+    "India": {"gl": "in", "hl": "en", "location": "Mumbai, Maharashtra, India"},
+    "Pakistan": {"gl": "pk", "hl": "en", "location": "Karachi, Sindh, Pakistan"},
+    "Germany": {"gl": "de", "hl": "de", "location": "Berlin, Germany"},
+    "France": {"gl": "fr", "hl": "fr", "location": "Paris, France"},
+    "Spain": {"gl": "es", "hl": "es", "location": "Madrid, Spain"},
 }
 
 
@@ -55,11 +59,6 @@ def domain_matches(link, target_domain):
     Only the exact host the user entered counts (the `www.` prefix is normalized
     away by get_root_domain, so `www.folio3.com` and `folio3.com` are treated as
     the same host).
-
-    - Enter `folio3.com` → matches ONLY `folio3.com` (not `agtech.folio3.com`,
-      not `blog.folio3.com`).
-    - Enter `agtech.folio3.com` → matches ONLY `agtech.folio3.com` (not the
-      parent `folio3.com`, not sibling subdomains).
     """
     result_domain = get_root_domain(link)
     if not result_domain or not target_domain:
@@ -113,9 +112,9 @@ def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, d
 
     Google deprecated the `num=` query parameter in late 2025 — requesting
     `num=100` no longer reliably returns 100 results. The supported path is
-    paginated `page=1..N` with `num=10`, which we accumulate into a single
-    ordered list. We use a global counter as the rank (1-indexed across pages)
-    and stop early when the target domain is found to save API credits.
+    paginated `page=1..N` with `num=10`. We use Serper's `position` field
+    (Google's actual organic position) when present and stop early when the
+    target domain is found to save API credits.
     """
     pages_needed = max(1, (depth + 9) // 10)
 
@@ -144,8 +143,10 @@ def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, d
         for item in organic:
             rank_counter += 1
             link = item.get("link", "")
+            api_pos = item.get("position")
+            position = api_pos if isinstance(api_pos, int) and api_pos > 0 else rank_counter
             entry = {
-                "position": rank_counter, "url": link,
+                "position": position, "url": link,
                 "title": item.get("title", ""), "snippet": item.get("snippet", ""),
             }
             all_organic.append(entry)
@@ -335,6 +336,14 @@ def render_sidebar():
         with st.expander("🌍 SERP Targeting", expanded=True):
             country = st.selectbox("Country / Location", list(LOCATION_PRESETS.keys()), index=0)
             preset = LOCATION_PRESETS[country]
+            custom_location = st.text_input(
+                "Custom Location (optional)",
+                placeholder="e.g. Austin, Texas, United States",
+                help="Override the preset above with any Serper-supported location "
+                     "string. Use this to match the city your VPN exits from for "
+                     "the most consistent results.",
+            )
+            location = custom_location.strip() or preset["location"]
             device = st.selectbox("Device", ["desktop", "mobile"], index=0)
             depth_label = st.select_slider(
                 "Tracking Depth",
@@ -345,6 +354,7 @@ def render_sidebar():
             )
             depth_map = {"Top 10": 10, "Top 20": 20, "Top 30": 30, "Top 50": 50, "Top 100": 100}
             depth = depth_map[depth_label]
+            st.caption(f"📍 Searching from: **{location}**")
 
         st.divider()
         st.markdown("### 📥 Keywords")
@@ -385,7 +395,7 @@ def render_sidebar():
             "country": country,
             "gl": preset["gl"],
             "hl": preset["hl"],
-            "location": preset["location"],
+            "location": location,
             "device": device,
             "depth": depth,
             "keywords": keywords,
@@ -493,17 +503,22 @@ def render_intelligence(df_res):
         },
     )
 
-    with st.expander("ℹ️ Why does my Google search look different?"):
+    with st.expander("ℹ️ Why don't tool ranks exactly match my VPN check?"):
         st.markdown(
-            "- **Organic-only positions.** Featured snippets, ads, and PAA boxes are excluded "
-            "from the rank — same metric Ahrefs and Semrush use.\n"
-            "- **Strict host match.** Only the exact host you entered counts. "
-            "`folio3.com` will not match `agtech.folio3.com`; `agtech.folio3.com` "
-            "will not match `folio3.com` or `blog.folio3.com`.\n"
-            "- **Paginated SERP walk.** Google deprecated `num=100`, so we walk "
-            "`page=1..N` with `num=10` and accumulate a single ordered list — that "
-            "matches what you see scrolling Google page by page.\n"
-            "- **Caching.** Serper.dev caches SERPs briefly. Re-run the scan for a fresher snapshot."
+            "Google rankings are **not deterministic**. Two clean searches "
+            "for the same keyword from different US cities, or even minutes apart, "
+            "routinely differ by 5–20 positions. Reasons:\n\n"
+            "- **City-level geo-targeting.** Google personalizes by city, not just country. "
+            "Your VPN exits from a specific city; pick a matching city in **SERP Targeting** "
+            "(or paste an exact location in the Custom Location box) for the closest match.\n"
+            "- **Time-of-query churn.** Google updates its index continuously and runs "
+            "live A/B tests. Same query 5 minutes apart can return different ranks.\n"
+            "- **Strict host match.** Only the exact host you entered counts — "
+            "`folio3.com` won't match `agtech.folio3.com` and vice versa.\n"
+            "- **Authoritative position.** We use Serper's `position` field (Google's actual "
+            "organic position), so featured snippets, ads, and PAA boxes don't shift the rank.\n"
+            "- **Paginated walk.** Since Google deprecated `num=100`, we walk `page=1..N` "
+            "with `num=10` to reach pages 2–10."
         )
 
 
