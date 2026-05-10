@@ -9,7 +9,7 @@ import plotly.express as px
 
 
 SERPER_ENDPOINT = "https://google.serper.dev/search"
-SCHEMA_VERSION = 7  # bump on row-schema changes -> resets stale session_state
+SCHEMA_VERSION = 8  # bump on row-schema changes -> resets stale session_state
 
 LOCATION_PRESETS = {
     "United States": {"gl": "us", "hl": "en"},
@@ -28,10 +28,12 @@ def init_session_state():
     if st.session_state.get("schema_version") != SCHEMA_VERSION:
         st.session_state["results_data"] = []
         st.session_state["serp_cache"] = {}
+        st.session_state["debug_data"] = {}
         st.session_state["schema_version"] = SCHEMA_VERSION
     st.session_state.setdefault("domain", "")
     st.session_state.setdefault("results_data", [])
     st.session_state.setdefault("serp_cache", {})
+    st.session_state.setdefault("debug_data", {})
     st.session_state.setdefault("last_run_at", None)
 
 
@@ -107,26 +109,14 @@ def _post_serper(body, api_key):
 
 
 def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, depth=100):
-    """Walk Google's SERP page-by-page (num=10) up to `depth` results.
-
-    Why pagination (not num=100): Serper.dev silently caps `num` near 10 in
-    most setups, so a single num=100 request returns only the first ~10
-    organics — anything past page 1 is missed. Paginating with num=10
-    across pages 1..N reliably reaches positions 30-100.
-
-    Position = CUMULATIVE COUNTER across pages (organic results seen so far,
-    1-indexed). This is the organic-only rank. Manual browser checks may
-    show different numbers because Google interleaves ads / featured
-    snippets / People-Also-Ask boxes that aren't counted here.
-
-    Stops on: match found, empty page, hard error, or max pages.
-    """
+    """Walk Google's SERP page-by-page (num=10), returning rank + raw debug data."""
     pages_needed = max(1, (depth + 9) // 10)
 
     all_organic = []
     matches = []
     cumulative = 0
     first_page_payload = None
+    debug_pages = []
 
     for page in range(1, pages_needed + 1):
         body = {
@@ -139,21 +129,27 @@ def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, d
 
         res = _post_serper(body, api_key)
         if "error" in res:
+            debug_pages.append({"page": page, "error": res.get("msg") or res["error"],
+                                "organic_count": 0, "urls": []})
             if all_organic:
                 break
-            return res
+            return {**res, "debug_pages": debug_pages}
 
         payload = res["payload"]
         if page == 1:
             first_page_payload = payload
 
         organic = payload.get("organic", []) or []
-        if not organic:
-            break
-
+        page_urls = []
         for item in organic:
             cumulative += 1
             link = item.get("link", "")
+            page_urls.append({
+                "cumulative": cumulative,
+                "serper_position": item.get("position"),
+                "url": link,
+                "domain": get_root_domain(link),
+            })
             entry = {
                 "position": cumulative,
                 "url": link,
@@ -165,6 +161,15 @@ def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, d
 
             if domain_matches(link, target_domain):
                 matches.append(entry)
+
+        debug_pages.append({
+            "page": page,
+            "organic_count": len(organic),
+            "urls": page_urls,
+        })
+
+        if not organic:
+            break
 
         if matches:
             break
@@ -182,6 +187,7 @@ def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, d
         "features": detect_serp_features(first_page_payload or {}),
         "top_competitors": top_competitors,
         "results_count": len(all_organic),
+        "debug_pages": debug_pages,
     }
 
     if matches:
@@ -278,6 +284,7 @@ def run_tracking(keywords, target_domain, api_key, gl, hl, location, device, dep
 
     rows = []
     cache = {}
+    debug = {}
 
     for i, kw in enumerate(keywords):
         progress_text.markdown(
@@ -288,6 +295,8 @@ def run_tracking(keywords, target_domain, api_key, gl, hl, location, device, dep
 
         if "error" in res:
             st.error(f"{res['error']}: {res['msg']}")
+            if res.get("debug_pages"):
+                debug[kw] = res["debug_pages"]
             break
 
         rank = res.get("rank")
@@ -308,6 +317,7 @@ def run_tracking(keywords, target_domain, api_key, gl, hl, location, device, dep
             "Results Found": res.get("results_count", 0),
         })
         cache[kw] = top_competitors
+        debug[kw] = res.get("debug_pages", [])
 
         progress_bar.progress((i + 1) / len(keywords))
         if i < len(keywords) - 1:
@@ -319,6 +329,7 @@ def run_tracking(keywords, target_domain, api_key, gl, hl, location, device, dep
     if rows:
         st.session_state.results_data = rows
         st.session_state.serp_cache = cache
+        st.session_state.debug_data = debug
         st.session_state.last_run_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         st.toast(f"✓ Tracked {len(rows)} keywords", icon="✅")
 
@@ -425,9 +436,9 @@ def render_dashboard(df_res):
 
     if total_kw > 0 and top_100 == 0 and (df_res["Results Found"] > 0).any():
         st.warning(
-            "⚠️ None of your keywords ranked in the top scan range. Open the "
-            "**SERP Inspector** to see who's ranking — your domain may not "
-            "rank for these terms in this country."
+            "⚠️ None of your keywords ranked in the scan range. Open the "
+            "**🐛 Debug** tab to see exactly what Serper returned per page — "
+            "that'll tell us if Serper is hitting a depth limit."
         )
 
     c1, c2, c3, c4 = st.columns(4)
@@ -524,21 +535,6 @@ def render_intelligence(df_res):
         },
     )
 
-    with st.expander("ℹ️ How are ranks calculated?"):
-        st.markdown(
-            "- **Paginated walk** through Google's SERP (1 page = 10 organic "
-            "results per request) until your domain is found or `Tracking Depth` "
-            "is reached. Rank = cumulative count of organic results seen.\n"
-            "- **Strict host match**: only your exact host counts. `agtech.folio3.com` "
-            "is never confused with `folio3.com` or `blog.folio3.com`.\n"
-            "- **`autocorrect: false`**: Google scores the EXACT query you typed.\n"
-            "- **Why might Google in my browser look different?** Browser views "
-            "include ads, featured snippets, People-Also-Ask boxes, and image / "
-            "video carousels — counting those visually inflates 'position'. "
-            "This tool reports *organic-only* position (the SEO-industry "
-            "standard, same as Ahrefs / Semrush)."
-        )
-
 
 def render_serp_inspector(df_res):
     st.markdown("##### 🔬 SERP Inspector")
@@ -588,6 +584,95 @@ def render_serp_inspector(df_res):
         st.success(f"✓ `{target}` appears in the top 10 for this keyword.")
 
 
+def render_debug():
+    st.markdown("##### 🐛 Raw Serper Debug")
+    st.caption("Exactly what Serper returned for each keyword — page-by-page. "
+               "Use this to verify whether Serper is reaching deep enough into "
+               "the SERP, or whether it's stopping early.")
+
+    debug = st.session_state.get("debug_data") or {}
+    if not debug:
+        st.info("Run a tracking session first.")
+        return
+
+    target = get_root_domain(st.session_state.get("domain", ""))
+    keyword = st.selectbox("Keyword", list(debug.keys()), key="debug_kw")
+    if not keyword:
+        return
+
+    pages = debug.get(keyword, [])
+    total_organics = sum(p.get("organic_count", 0) for p in pages)
+    pages_walked = len(pages)
+    found_at = None
+    for p in pages:
+        for u in p.get("urls", []) or []:
+            if domain_matches(u["url"], target):
+                found_at = u["cumulative"]
+                break
+        if found_at:
+            break
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Pages walked", pages_walked)
+    c2.metric("Organics returned", total_organics)
+    c3.metric("Target found at", str(found_at) if found_at else "—")
+    c4.metric("Search target", target or "—")
+
+    st.markdown("###### Per-page breakdown")
+    breakdown_rows = []
+    for p in pages:
+        if "error" in p:
+            breakdown_rows.append({
+                "Page": p["page"],
+                "Organics": "—",
+                "Range": "—",
+                "Status": f"❌ {p['error']}",
+            })
+            continue
+        urls = p.get("urls") or []
+        if urls:
+            rng = f"{urls[0]['cumulative']} – {urls[-1]['cumulative']}"
+        else:
+            rng = "—"
+        breakdown_rows.append({
+            "Page": p["page"],
+            "Organics": p.get("organic_count", 0),
+            "Range": rng,
+            "Status": "✓" if urls else "⚠️ empty",
+        })
+    st.dataframe(pd.DataFrame(breakdown_rows), use_container_width=True, hide_index=True)
+
+    if total_organics < 30:
+        st.warning(
+            f"⚠️ Serper returned only **{total_organics}** organic results "
+            f"across {pages_walked} pages. If your keyword's real position is "
+            f"deeper than this, the API didn't see it. This is a Serper.dev "
+            f"depth limitation — switching to DataForSEO or SerpAPI would "
+            f"reach further."
+        )
+
+    st.markdown("###### All URLs Serper saw (in order)")
+    flat = []
+    for p in pages:
+        for u in p.get("urls") or []:
+            is_you = domain_matches(u["url"], target)
+            flat.append({
+                "Position": u["cumulative"],
+                "Page": p["page"],
+                "Serper Pos (per-page)": u.get("serper_position", "—"),
+                "Domain": u["domain"] + (" 🟢 (you)" if is_you else ""),
+                "URL": u["url"],
+            })
+    if flat:
+        st.dataframe(
+            pd.DataFrame(flat), use_container_width=True, hide_index=True,
+            height=min(560, 45 + 35 * len(flat)),
+            column_config={"URL": st.column_config.LinkColumn("URL", width="medium")},
+        )
+    else:
+        st.warning("No organic results were returned for this keyword.")
+
+
 def render_exports(df_res):
     st.markdown("##### 📑 Export & Share")
     csv = df_res.drop(columns=["Position", "Results Found"], errors="ignore") \
@@ -629,8 +714,9 @@ def main():
                 depth=cfg["depth"],
             )
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["📊 Dashboard", "🔍 Keyword Intelligence", "🔬 SERP Inspector", "📑 Export"]
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["📊 Dashboard", "🔍 Keyword Intelligence", "🔬 SERP Inspector",
+         "🐛 Debug", "📑 Export"]
     )
 
     if not st.session_state.results_data:
@@ -646,6 +732,8 @@ def main():
     with tab3:
         render_serp_inspector(df_res)
     with tab4:
+        render_debug()
+    with tab5:
         render_exports(df_res)
 
 
