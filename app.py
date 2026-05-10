@@ -9,7 +9,7 @@ import plotly.express as px
 
 
 SERPER_ENDPOINT = "https://google.serper.dev/search"
-SCHEMA_VERSION = 6  # bump on row-schema changes -> resets stale session_state
+SCHEMA_VERSION = 7  # bump on row-schema changes -> resets stale session_state
 
 LOCATION_PRESETS = {
     "United States": {"gl": "us", "hl": "en"},
@@ -49,7 +49,6 @@ def get_root_domain(url_or_domain):
 
 
 def domain_matches(link, target_domain):
-    """Strict exact-host match."""
     if not link or not target_domain:
         return False
     return get_root_domain(link) == target_domain
@@ -89,7 +88,7 @@ def _post_serper(body, api_key):
     for attempt in range(3):
         try:
             r = requests.post(SERPER_ENDPOINT, headers=headers,
-                              data=json.dumps(body), timeout=30)
+                              data=json.dumps(body), timeout=25)
             if r.status_code in (401, 403):
                 return {"error": "API Key Error",
                         "msg": "Unauthorized — check your Serper.dev API key."}
@@ -108,53 +107,81 @@ def _post_serper(body, api_key):
 
 
 def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, depth=100):
-    """Single Serper call returning up to `depth` organic results.
+    """Walk Google's SERP page-by-page (num=10) up to `depth` results.
 
-    ACCURACY: ONE request with num=depth (no pagination). In a single-call
-    response, Serper's `position` field is absolute — that's the ground truth
-    for organic-only ranking. Pagination produced drift because per-page
-    positions are page-relative and pages can drop/duplicate results.
+    Why pagination (not num=100): Serper.dev silently caps `num` near 10 in
+    most setups, so a single num=100 request returns only the first ~10
+    organics — anything past page 1 is missed. Paginating with num=10
+    across pages 1..N reliably reaches positions 30-100.
+
+    Position = CUMULATIVE COUNTER across pages (organic results seen so far,
+    1-indexed). This is the organic-only rank. Manual browser checks may
+    show different numbers because Google interleaves ads / featured
+    snippets / People-Also-Ask boxes that aren't counted here.
+
+    Stops on: match found, empty page, hard error, or max pages.
     """
-    body = {
-        "q": keyword, "gl": gl, "hl": hl,
-        "num": max(10, min(depth, 100)),
-        "device": device,
-        "autocorrect": False,
-    }
-    if location:
-        body["location"] = location
+    pages_needed = max(1, (depth + 9) // 10)
 
-    res = _post_serper(body, api_key)
-    if "error" in res:
-        return res
-
-    payload = res["payload"]
-    organic = payload.get("organic", []) or []
-
+    all_organic = []
     matches = []
-    cleaned = []
-    for idx, item in enumerate(organic, start=1):
-        link = item.get("link", "")
-        serper_pos = item.get("position")
-        position = serper_pos if isinstance(serper_pos, int) and serper_pos > 0 else idx
-        entry = {
-            "position": position, "url": link,
-            "title": item.get("title", ""), "snippet": item.get("snippet", ""),
+    cumulative = 0
+    first_page_payload = None
+
+    for page in range(1, pages_needed + 1):
+        body = {
+            "q": keyword, "gl": gl, "hl": hl,
+            "num": 10, "page": page, "device": device,
+            "autocorrect": False,
         }
-        cleaned.append(entry)
-        if domain_matches(link, target_domain):
-            matches.append(entry)
+        if location:
+            body["location"] = location
+
+        res = _post_serper(body, api_key)
+        if "error" in res:
+            if all_organic:
+                break
+            return res
+
+        payload = res["payload"]
+        if page == 1:
+            first_page_payload = payload
+
+        organic = payload.get("organic", []) or []
+        if not organic:
+            break
+
+        for item in organic:
+            cumulative += 1
+            link = item.get("link", "")
+            entry = {
+                "position": cumulative,
+                "url": link,
+                "title": item.get("title", ""),
+                "snippet": item.get("snippet", ""),
+                "page": page,
+            }
+            all_organic.append(entry)
+
+            if domain_matches(link, target_domain):
+                matches.append(entry)
+
+        if matches:
+            break
+
+        if page < pages_needed:
+            time.sleep(0.4)
 
     top_competitors = [
         {"position": e["position"], "domain": get_root_domain(e["url"]),
          "url": e["url"], "title": e["title"]}
-        for e in cleaned[:10]
+        for e in all_organic[:10]
     ]
 
     base = {
-        "features": detect_serp_features(payload),
+        "features": detect_serp_features(first_page_payload or {}),
         "top_competitors": top_competitors,
-        "results_count": len(cleaned),
+        "results_count": len(all_organic),
     }
 
     if matches:
@@ -304,7 +331,7 @@ def render_sidebar():
             placeholder="yourdomain.com  or  sub.yourdomain.com",
             value=st.session_state.domain,
             help="Strict exact-host match. `agtech.folio3.com` will NEVER match "
-                 "`folio3.com` or `blog.folio3.com`. Track each subdomain separately.",
+                 "`folio3.com` or `blog.folio3.com`.",
         )
         if target_domain:
             resolved = get_root_domain(target_domain)
@@ -325,8 +352,7 @@ def render_sidebar():
                 "Tracking Depth",
                 options=["Top 10", "Top 20", "Top 30", "Top 50", "Top 100"],
                 value="Top 100",
-                help="Single API call requesting this many organic results. "
-                     "Top 100 = max depth, 1 credit per keyword.",
+                help="How deep to walk the SERP. 1 API credit per page (max 10 for Top 100).",
             )
             depth_map = {"Top 10": 10, "Top 20": 20, "Top 30": 30,
                          "Top 50": 50, "Top 100": 100}
@@ -399,8 +425,9 @@ def render_dashboard(df_res):
 
     if total_kw > 0 and top_100 == 0 and (df_res["Results Found"] > 0).any():
         st.warning(
-            "⚠️ None of your keywords ranked in the top scan range, but Serper "
-            "IS returning results. Open the **SERP Inspector** to see who's ranking."
+            "⚠️ None of your keywords ranked in the top scan range. Open the "
+            "**SERP Inspector** to see who's ranking — your domain may not "
+            "rank for these terms in this country."
         )
 
     c1, c2, c3, c4 = st.columns(4)
@@ -499,17 +526,17 @@ def render_intelligence(df_res):
 
     with st.expander("ℹ️ How are ranks calculated?"):
         st.markdown(
-            "- **One Serper.dev call per keyword**, requesting up to 100 organic "
-            "results in a single request. Serper's `position` field in single-call "
-            "mode is the absolute SERP rank — the same metric Ahrefs and Semrush use.\n"
+            "- **Paginated walk** through Google's SERP (1 page = 10 organic "
+            "results per request) until your domain is found or `Tracking Depth` "
+            "is reached. Rank = cumulative count of organic results seen.\n"
             "- **Strict host match**: only your exact host counts. `agtech.folio3.com` "
             "is never confused with `folio3.com` or `blog.folio3.com`.\n"
             "- **`autocorrect: false`**: Google scores the EXACT query you typed.\n"
-            "- **Why might Google in my browser look different?** Your browser "
-            "personalizes results (location, history, account) and visually "
-            "interleaves ads / featured snippets / People-Also-Ask boxes that you "
-            "may count as 'positions'. Tools like ours track *organic-only* "
-            "positions — your real SEO rank."
+            "- **Why might Google in my browser look different?** Browser views "
+            "include ads, featured snippets, People-Also-Ask boxes, and image / "
+            "video carousels — counting those visually inflates 'position'. "
+            "This tool reports *organic-only* position (the SEO-industry "
+            "standard, same as Ahrefs / Semrush)."
         )
 
 
