@@ -115,15 +115,17 @@ def _post_serper(body, api_key):
 def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, depth=50):
     """Walk Google's SERP page-by-page (num=10) up to `depth` results.
 
-    ACCURACY NOTES:
-    1. We trust Serper's `position` field as the authoritative rank — that's
-       the SERP position Serper computes server-side and what Ahrefs / Semrush
-       effectively rely on. A cumulative counter runs alongside as a sanity
-       check; if they disagree, we log a warning and use Serper's value.
-    2. Pages with SERP features (PAA, image packs) routinely return 7-9
-       organic results. We do NOT bail on partial pages — only on a truly
-       empty page, error, or match.
-    3. `autocorrect: false` so Google scores the exact query you typed.
+    POSITION CALCULATION (rock-solid):
+    We use a CUMULATIVE COUNTER — every organic result we see across all pages
+    increments it by 1. Serper's per-result `position` field cannot be trusted
+    on paginated requests: it returns 1-10 RELATIVE TO EACH PAGE, not the
+    absolute SERP position. Trusting it produces nonsense like "rank=6 on page 3".
+
+    Other accuracy guarantees:
+    - Never bail on partial pages (Google often returns 7-9 organics when
+      SERP features take space). Only stop on truly empty page / error / match.
+    - `autocorrect: false` so Google scores the exact query you typed.
+    - Strict exact-host match — `agtech.folio3.com` never matches `folio3.com`.
     """
     pages_needed = max(1, (depth + 9) // 10)
 
@@ -132,7 +134,6 @@ def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, d
     cumulative = 0
     first_page_payload = None
     found_on_page = None
-    position_disagreement = False
 
     for page in range(1, pages_needed + 1):
         body = {
@@ -160,18 +161,12 @@ def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, d
         for item in organic:
             cumulative += 1
             link = item.get("link", "")
-            serper_pos = item.get("position")
-            if isinstance(serper_pos, int) and serper_pos > 0:
-                position = serper_pos
-                if abs(position - cumulative) > 2:
-                    position_disagreement = True
-            else:
-                position = cumulative
-
             entry = {
-                "position": position, "url": link,
+                "position": cumulative,  # absolute SERP rank; never use Serper's per-page value
+                "url": link,
                 "title": item.get("title", ""),
                 "snippet": item.get("snippet", ""),
+                "page": page,
             }
             all_organic.append(entry)
 
@@ -196,7 +191,6 @@ def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, d
         "features": detect_serp_features(first_page_payload or {}),
         "top_competitors": top_competitors,
         "results_count": len(all_organic),
-        "position_disagreement": position_disagreement,
     }
 
     if matches:
@@ -298,7 +292,6 @@ def run_tracking(keywords, target_domain, api_key, gl, hl, location, device, dep
 
     rows = []
     cache = {}
-    any_disagreement = False
 
     for i, kw in enumerate(keywords):
         progress_text.markdown(
@@ -319,9 +312,6 @@ def run_tracking(keywords, target_domain, api_key, gl, hl, location, device, dep
         page_str = f"Page {page_found}" if page_found else "—"
         top_competitors = res.get("top_competitors", [])
         top_result = top_competitors[0]["domain"] if top_competitors else "—"
-
-        if res.get("position_disagreement"):
-            any_disagreement = True
 
         rows.append({
             "Keyword": kw,
@@ -348,12 +338,6 @@ def run_tracking(keywords, target_domain, api_key, gl, hl, location, device, dep
         st.session_state.results_data = rows
         st.session_state.serp_cache = cache
         st.session_state.last_run_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        if any_disagreement:
-            st.warning(
-                "ℹ️ For some keywords, Serper's reported position differed slightly "
-                "from our cumulative counter (likely due to SERP features). "
-                "We used Serper's authoritative value — same as Ahrefs / Semrush."
-            )
         st.toast(f"✓ Tracked {len(rows)} keywords", icon="✅")
 
 
@@ -571,15 +555,15 @@ def render_intelligence(df_res):
 
     with st.expander("ℹ️ How accurate are these rankings?"):
         st.markdown(
-            "- **Authoritative source**: We use Serper.dev's `position` field, "
-            "which is the SERP position Google itself returns. Same metric "
-            "Ahrefs and Semrush rely on.\n"
+            "- **Cumulative-counter position**: every organic result we see across "
+            "all pages increments the rank by 1. Serper's per-result `position` "
+            "field is page-relative on paginated requests (returns 1-10 for each "
+            "page) and is NOT used.\n"
             "- **Strict host match**: only your exact host counts. "
             "`agtech.folio3.com` is never confused with `folio3.com` or "
             "`blog.folio3.com`.\n"
             "- **Full pagination**: walks pages 1 → N until your domain is "
-            "found OR depth is reached. Never bails on partial pages "
-            "(SERP features cause Google to return 7-9 results sometimes).\n"
+            "found OR depth is reached. Never bails on partial pages.\n"
             "- **`autocorrect: false`**: Google scores the EXACT query you "
             "typed. No silent rewriting.\n"
             "- **Why might Google in my browser look different?** Your browser "
