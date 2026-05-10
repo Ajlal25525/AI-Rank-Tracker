@@ -108,9 +108,10 @@ def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, d
 
     Google deprecated the `num=` query parameter in late 2025, so requesting
     `num=100` no longer reliably returns 100 results. The supported path is
-    paginated `page=1..N` with `num=10`. We use a single global counter as
-    the rank (1-indexed across pages) and stop early when the target domain
-    is found to save API credits.
+    paginated `page=1..N` with `num=10`. We walk every requested page (only
+    stopping on a truly empty response) and use Serper's `position` field —
+    Google's actual organic rank — so that SERP features don't cause us to
+    under-count.
     """
     pages_needed = max(1, (depth + 9) // 10)
 
@@ -143,15 +144,20 @@ def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, d
             break
 
         for item in organic:
-            # Always use the cumulative counter as the rank. Serper's `position`
-            # field is unreliable across paginated calls — it sometimes returns
-            # the per-page index (1–10) instead of the global index, which
-            # mis-reports any rank past page 1. The counter below gives the
-            # rank you'd get scrolling Google top-to-bottom.
             rank_counter += 1
             link = item.get("link", "")
+            # Prefer Serper's `position` field — it reflects Google's actual
+            # organic position INCLUDING the slots taken by SERP features
+            # (PAA, ads, featured snippet, knowledge panel). Falling back to
+            # the cumulative counter would systematically *undercount* on
+            # competitive queries because SERP-feature slots aren't counted.
+            api_pos = item.get("position")
+            if isinstance(api_pos, int) and api_pos >= rank_counter:
+                position = api_pos
+            else:
+                position = rank_counter
             entry = {
-                "position": rank_counter, "url": link,
+                "position": position, "url": link,
                 "title": item.get("title", ""), "snippet": item.get("snippet", ""),
             }
             all_organic.append(entry)
@@ -160,8 +166,11 @@ def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, d
 
         if matches:
             break
-        if len(organic) < 10:
-            break
+        # Do NOT break on partial pages (len < 10). Competitive SERPs often
+        # return 7–9 organic results per page because SERP features take the
+        # rest. Breaking here would abort pagination and miss page 2–10
+        # rankings. Only the empty-page check above (`if not organic: break`)
+        # should terminate the walk early.
         if page < pages_needed:
             time.sleep(0.5)
 
@@ -519,10 +528,14 @@ def render_intelligence(df_res):
             "hint — the broadest, most user-like SERP. Add a city in **SERP "
             "Targeting → City-level Location** only if you want results "
             "geo-targeted to a specific city.\n"
-            "- **Cumulative rank counter.** We count every organic result "
-            "across pages (1, 2, …, 11, 12, …). Serper's per-result `position` "
-            "field is page-relative across paginated calls and would mis-report "
-            "ranks past page 1.\n"
+            "- **Authoritative rank.** We use Serper's `position` field — "
+            "Google's actual organic position, which preserves the gaps left "
+            "by SERP features (PAA, ads, featured snippet, knowledge panel). "
+            "A simple cumulative counter would underestimate the rank because "
+            "those feature slots aren't counted.\n"
+            "- **Walk every requested page.** We never break on a partial "
+            "page — competitive SERPs often return 7–9 organic per page, and "
+            "stopping there would miss your page 2–10 rankings.\n"
             "- **`autocorrect: false`.** Forces Google to score the exact "
             "query you entered — no query rewriting, no broadening.\n"
             "- **Strict host match.** Only the exact host you entered counts.\n"
