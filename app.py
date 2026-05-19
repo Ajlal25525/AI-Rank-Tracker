@@ -9,7 +9,6 @@ import plotly.express as px
 
 
 SERPER_ENDPOINT = "https://google.serper.dev/search"
-SCHEMA_VERSION = 8  # bump on row-schema changes -> resets stale session_state
 
 LOCATION_PRESETS = {
     "United States": {"gl": "us", "hl": "en"},
@@ -25,16 +24,18 @@ LOCATION_PRESETS = {
 
 
 def init_session_state():
-    if st.session_state.get("schema_version") != SCHEMA_VERSION:
-        st.session_state["results_data"] = []
-        st.session_state["serp_cache"] = {}
-        st.session_state["debug_data"] = {}
-        st.session_state["schema_version"] = SCHEMA_VERSION
-    st.session_state.setdefault("domain", "")
-    st.session_state.setdefault("results_data", [])
-    st.session_state.setdefault("serp_cache", {})
-    st.session_state.setdefault("debug_data", {})
-    st.session_state.setdefault("last_run_at", None)
+    defaults = {
+        "domain": "",
+        "results_data": [],
+        "serp_cache": {},
+        "debug_data": {},
+        "last_run_at": None,
+        "previous_run": {},          # {keyword: position} from the prior scan
+        "previous_run_at": None,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
 
 def get_root_domain(url_or_domain):
@@ -51,23 +52,39 @@ def get_root_domain(url_or_domain):
 
 
 def domain_matches(link, target_domain):
+    """Subdomain-tolerant match — mirrors the working local-team code.
+
+    - Enter `folio3.com` → matches `folio3.com`, `agtech.folio3.com`,
+      `blog.folio3.com`, etc.
+    - Enter `agtech.folio3.com` → matches `agtech.folio3.com` and any
+      deeper subdomain; will NOT match the parent `folio3.com` or sibling
+      subdomains like `blog.folio3.com`.
+    """
     if not link or not target_domain:
         return False
-    return get_root_domain(link) == target_domain
+    result_domain = get_root_domain(link)
+    return (result_domain == target_domain
+            or result_domain.endswith("." + target_domain))
 
 
 def determine_page_type(url):
+    """Classify a URL into Blog / Product / Homepage / Landing Page."""
     if not url or url == "N/A":
         return "N/A"
     path = urlparse(url.lower()).path
-    if any(m in path for m in ["/blog", "/article", "/post", "/news", "/insights",
-                                "/resources/blog", "/learn", "/guides", "/case-stud"]):
+    blog_markers = ["/blog", "/article", "/post", "/news", "/insights",
+                    "/resources/blog", "/learn", "/guides", "/case-stud"]
+    if any(m in path for m in blog_markers):
         return "Blog"
     if any(m in path for m in ["/product", "/services", "/solutions", "/pricing", "/features"]):
         return "Product"
     if path in ("", "/"):
         return "Homepage"
     return "Landing Page"
+
+
+def google_verify_url(keyword, gl="us"):
+    return f"https://www.google.com/search?q={quote_plus(keyword)}&gl={gl}&pws=0&num=20"
 
 
 def detect_serp_features(payload):
@@ -84,50 +101,75 @@ def detect_serp_features(payload):
     return ", ".join(label for k, label in fmap if k in payload) or "—"
 
 
-def _post_serper(body, api_key):
+def _fetch_page(keyword, page, api_key, gl, hl, location, device):
+    """Single Serper page fetch — minimal body, 2 attempts, 2.0s retry sleep.
+
+    Mirrors the working local-team code's logic:
+      - No `autocorrect` override (let Google behave naturally).
+      - No `location` unless the user explicitly opted in.
+      - On transient failures we retry once with a 2s sleep, then fall back
+        to an empty page (the caller treats empty as 'no more results').
+    """
     headers = {"X-API-KEY": api_key, "Content-Type": "application/json"}
-    last_err = None
-    for attempt in range(3):
+    body = {"q": keyword, "gl": gl, "hl": hl,
+            "page": page, "num": 10, "device": device}
+    if location:
+        body["location"] = location
+
+    for attempt in range(2):
         try:
             r = requests.post(SERPER_ENDPOINT, headers=headers,
-                              data=json.dumps(body), timeout=25)
-            if r.status_code in (401, 403):
+                              data=json.dumps(body), timeout=15)
+            if r.status_code == 403:
                 return {"error": "API Key Error",
                         "msg": "Unauthorized — check your Serper.dev API key."}
             if r.status_code in (402, 429):
                 return {"error": "Rate Limited",
-                        "msg": "Serper.dev rate limit / credits exhausted."}
+                        "msg": "Serper.dev rate limit hit."}
             if r.status_code != 200:
-                last_err = f"HTTP {r.status_code}: {r.text[:200]}"
-                time.sleep(1.5 * (attempt + 1))
+                if attempt == 0:
+                    time.sleep(2.0)
+                    continue
+                return {"payload": {"organic": []}}
+            data = r.json()
+            organic = data.get("organic", [])
+            if organic:
+                return {"payload": data}
+            # Empty but valid — retry once in case of transient hiccup.
+            if attempt == 0:
+                time.sleep(2.0)
                 continue
-            return {"payload": r.json()}
+            return {"payload": data}
         except requests.RequestException as e:
-            last_err = str(e)
-            time.sleep(1.5 * (attempt + 1))
-    return {"error": "Network Error", "msg": last_err or "Unknown error"}
+            if attempt == 0:
+                time.sleep(2.0)
+                continue
+            return ({"error": "Error", "msg": str(e)} if page == 1
+                    else {"payload": {"organic": []}})
+    return {"payload": {"organic": []}}
 
 
 def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, depth=100):
-    """Walk Google's SERP page-by-page (num=10), returning rank + raw debug data."""
+    """Walk Google SERP page-by-page (num=10) up to `depth` results.
+
+    Port of the working local-team code's logic:
+      - Minimal request body (no autocorrect override).
+      - 2-attempt fetch per page with a 2s retry sleep (`_fetch_page`).
+      - 1.0s sleep between pages so Serper returns a stable snapshot.
+      - Subdomain-tolerant `domain_matches` for the rank check.
+      - Pure cumulative rank counter (never trusts Serper's position field
+        across pages).
+    """
     pages_needed = max(1, (depth + 9) // 10)
 
     all_organic = []
+    rank_counter = 0
     matches = []
-    cumulative = 0
     first_page_payload = None
     debug_pages = []
 
     for page in range(1, pages_needed + 1):
-        body = {
-            "q": keyword, "gl": gl, "hl": hl,
-            "num": 10, "page": page, "device": device,
-            "autocorrect": False,
-        }
-        if location:
-            body["location"] = location
-
-        res = _post_serper(body, api_key)
+        res = _fetch_page(keyword, page, api_key, gl, hl, location, device)
         if "error" in res:
             debug_pages.append({"page": page, "error": res.get("msg") or res["error"],
                                 "organic_count": 0, "urls": []})
@@ -142,23 +184,22 @@ def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, d
         organic = payload.get("organic", []) or []
         page_urls = []
         for item in organic:
-            cumulative += 1
+            rank_counter += 1
             link = item.get("link", "")
             page_urls.append({
-                "cumulative": cumulative,
+                "cumulative": rank_counter,
                 "serper_position": item.get("position"),
                 "url": link,
                 "domain": get_root_domain(link),
             })
             entry = {
-                "position": cumulative,
+                "position": rank_counter,
                 "url": link,
                 "title": item.get("title", ""),
                 "snippet": item.get("snippet", ""),
                 "page": page,
             }
             all_organic.append(entry)
-
             if domain_matches(link, target_domain):
                 matches.append(entry)
 
@@ -170,12 +211,10 @@ def analyze_keyword(keyword, target_domain, api_key, gl, hl, location, device, d
 
         if not organic:
             break
-
         if matches:
             break
-
         if page < pages_needed:
-            time.sleep(0.4)
+            time.sleep(1.0)
 
     top_competitors = [
         {"position": e["position"], "domain": get_root_domain(e["url"]),
@@ -311,6 +350,7 @@ def run_tracking(keywords, target_domain, api_key, gl, hl, location, device, dep
             "Rank": display_rank,
             "Position": position,
             "URL": url,
+            "Title": res.get("title", ""),
             "Page Type": determine_page_type(url),
             "SERP Features": res.get("features", "—"),
             "Top Result": top_result,
@@ -321,12 +361,21 @@ def run_tracking(keywords, target_domain, api_key, gl, hl, location, device, dep
 
         progress_bar.progress((i + 1) / len(keywords))
         if i < len(keywords) - 1:
-            time.sleep(0.4)
+            time.sleep(1.0)
 
     progress_text.empty()
     progress_bar.empty()
 
     if rows:
+        # Stash the prior scan's keyword→position map so the dashboard can
+        # compute deltas (up/down counts, avg-position change, etc.).
+        if st.session_state.results_data:
+            st.session_state.previous_run = {
+                r["Keyword"]: r["Position"]
+                for r in st.session_state.results_data
+            }
+            st.session_state.previous_run_at = st.session_state.last_run_at
+
         st.session_state.results_data = rows
         st.session_state.serp_cache = cache
         st.session_state.debug_data = debug
@@ -341,12 +390,14 @@ def render_sidebar():
             "Target Domain",
             placeholder="yourdomain.com  or  sub.yourdomain.com",
             value=st.session_state.domain,
-            help="Strict exact-host match. `agtech.folio3.com` will NEVER match "
-                 "`folio3.com` or `blog.folio3.com`.",
+            help="Subdomain-tolerant match. `folio3.com` matches "
+                 "`folio3.com`, `agtech.folio3.com`, `blog.folio3.com`, etc. "
+                 "Enter a specific subdomain (e.g. `agtech.folio3.com`) to "
+                 "narrow the match to that host and its sub-subdomains only.",
         )
         if target_domain:
             resolved = get_root_domain(target_domain)
-            st.caption(f"🎯 Strict match: **`{resolved}`**")
+            st.caption(f"🎯 Matches **`{resolved}`** and its subdomains")
         serper_key = st.text_input("Serper.dev API Key", type="password")
 
         with st.expander("🌍 SERP Targeting", expanded=True):
@@ -355,7 +406,10 @@ def render_sidebar():
             custom_location = st.text_input(
                 "City-level Location (optional)",
                 placeholder="e.g. Austin, Texas, United States",
-                help="Blank = country-level SERP. Fill in for city-targeted results.",
+                help="Leave blank for the broad, country-level view that any "
+                     "generic user in this country sees on Google. Fill in a "
+                     "city only if you want results geo-targeted to that "
+                     "specific city (matches a VPN exiting from that city).",
             )
             location = custom_location.strip()
             device = st.selectbox("Device", ["desktop", "mobile"], index=0)
@@ -363,18 +417,19 @@ def render_sidebar():
                 "Tracking Depth",
                 options=["Top 10", "Top 20", "Top 30", "Top 50", "Top 100"],
                 value="Top 100",
-                help="How deep to walk the SERP. 1 API credit per page (max 10 for Top 100).",
+                help="How deep to walk the SERP. 1 API credit per page; "
+                     "stops early once your domain is found.",
             )
-            depth_map = {"Top 10": 10, "Top 20": 20, "Top 30": 30,
-                         "Top 50": 50, "Top 100": 100}
+            depth_map = {"Top 10": 10, "Top 20": 20, "Top 30": 30, "Top 50": 50, "Top 100": 100}
             depth = depth_map[depth_label]
-            st.caption(f"📍 {location if location else f'Country-level {country}'}"
-                       f" · {device} · max {depth} results")
+            if location:
+                st.caption(f"📍 Targeting: **{location}**")
+            else:
+                st.caption(f"📍 Country-level **{country}** (gl={preset['gl']}, hl={preset['hl']})")
 
         st.divider()
         st.markdown("### 📥 Keywords")
-        method = st.radio("Input", ["Paste", "CSV Upload"],
-                          horizontal=True, label_visibility="collapsed")
+        method = st.radio("Input", ["Paste", "CSV Upload"], horizontal=True, label_visibility="collapsed")
 
         keywords = []
         if method == "CSV Upload":
@@ -382,9 +437,7 @@ def render_sidebar():
             if f is not None:
                 try:
                     df = pd.read_csv(f)
-                    col = next((c for c in df.columns
-                                if c.lower() in ["keyword", "keywords", "search term", "query", "term"]),
-                               None)
+                    col = next((c for c in df.columns if c.lower() in ["keyword", "keywords", "search term", "query", "term"]), None)
                     if col:
                         keywords = df[col].dropna().astype(str).str.strip().tolist()
                         st.success(f"Loaded {len(keywords)} keywords")
@@ -394,16 +447,14 @@ def render_sidebar():
                     st.error(f"CSV error: {e}")
         else:
             pasted = st.text_area(
-                "Paste keywords (one per line)", height=160,
-                label_visibility="collapsed",
+                "Paste keywords (one per line)", height=160, label_visibility="collapsed",
                 placeholder="ai keyword tracker\nrank tracker tool\nseo monitoring software",
             )
             keywords = [k.strip() for k in pasted.split("\n") if k.strip()]
             if keywords:
                 st.caption(f"{len(keywords)} keyword(s) ready")
 
-        run_btn = st.button("🚀 Run Live Tracking", type="primary",
-                            use_container_width=True)
+        run_btn = st.button("🚀 Run Live Tracking", type="primary", use_container_width=True)
 
         st.divider()
         if st.session_state.last_run_at:
@@ -423,6 +474,74 @@ def render_sidebar():
         }
 
 
+def _format_delta(delta, lower_is_better=False, suffix=""):
+    """Return colored ▲/▼ HTML for a numeric change, or em-dash if no delta."""
+    if delta is None:
+        return '<span style="color:#9ca3af;">—</span>'
+    if delta == 0:
+        return f'<span style="color:#9ca3af;">— {abs(delta):.1f}{suffix}</span>'
+    improving = (delta < 0) if lower_is_better else (delta > 0)
+    color = "#10b981" if improving else "#ef4444"
+    arrow = "▲" if delta > 0 else "▼"
+    return f'<span style="color:{color};">{arrow} {abs(delta):.1f}{suffix}</span>'
+
+
+def _compute_movement(df_res, previous_run):
+    """Count keywords whose Position went up / down / unchanged vs prior scan."""
+    up = down = same = new = 0
+    biggest_movers = []
+    for _, row in df_res.iterrows():
+        kw, cur = row["Keyword"], row["Position"]
+        prev = previous_run.get(kw)
+        if prev is None:
+            new += 1
+            continue
+        delta = prev - cur  # positive = moved up the SERP (lower position number)
+        if delta > 0:
+            up += 1
+        elif delta < 0:
+            down += 1
+        else:
+            same += 1
+        if delta != 0:
+            biggest_movers.append({"Keyword": kw, "Previous": prev,
+                                   "Current": cur, "Δ": delta})
+    return up, down, same, new, biggest_movers
+
+
+def _avg_delta(movers, sign):
+    """Average absolute Δ across movers in one direction. sign=1 → up, -1 → down."""
+    vals = [m["Δ"] for m in movers if (m["Δ"] > 0 if sign == 1 else m["Δ"] < 0)]
+    if not vals:
+        return "—"
+    return f"{abs(sum(vals)) / len(vals):.1f}"
+
+
+def _aggregate_competitors(serp_cache, target_domain):
+    """Roll up the top-10 per keyword into per-domain stats."""
+    by_domain = {}
+    for kw, competitors in serp_cache.items():
+        for c in competitors[:10]:
+            d = c.get("domain", "")
+            if not d:
+                continue
+            by_domain.setdefault(d, []).append(c.get("position", 0))
+    rows = []
+    for d, positions in by_domain.items():
+        positions = [p for p in positions if isinstance(p, (int, float)) and p > 0]
+        if not positions:
+            continue
+        is_you = (d == target_domain
+                  or (target_domain and d.endswith("." + target_domain)))
+        rows.append({
+            "Site": (f"🟢 {d} (you)" if is_you else d),
+            "Appearances": len(positions),
+            "Avg Position": sum(positions) / len(positions),
+        })
+    rows.sort(key=lambda r: (-r["Appearances"], r["Avg Position"]))
+    return rows[:15]
+
+
 def render_dashboard(df_res):
     all_pos = df_res["Position"].tolist()
     ranked = [p for p in all_pos if p <= 100]
@@ -431,56 +550,163 @@ def render_dashboard(df_res):
     top_10 = sum(1 for p in all_pos if p <= 10)
     top_20 = sum(1 for p in all_pos if p <= 20)
     top_100 = sum(1 for p in all_pos if p <= 100)
+    not_ranked = total_kw - top_100
     avg_pos = sum(ranked) / len(ranked) if ranked else None
-    visibility = round(top_10 / total_kw * 100, 1) if total_kw else 0
+
+    # ---------- Deltas vs previous scan ----------
+    previous_run = st.session_state.get("previous_run") or {}
+    prev_avg_pos = None
+    if previous_run:
+        prev_ranked = [p for p in previous_run.values() if p <= 100]
+        if prev_ranked:
+            prev_avg_pos = sum(prev_ranked) / len(prev_ranked)
+    avg_pos_delta = (
+        (avg_pos - prev_avg_pos) if (avg_pos is not None and prev_avg_pos is not None) else None
+    )
+    moved_up, moved_down, same, new_kws, biggest_movers = _compute_movement(df_res, previous_run)
 
     if total_kw > 0 and top_100 == 0 and (df_res["Results Found"] > 0).any():
         st.warning(
-            "⚠️ None of your keywords ranked in the scan range. Open the "
-            "**🐛 Debug** tab to see exactly what Serper returned per page — "
-            "that'll tell us if Serper is hitting a depth limit."
+            "⚠️ **None of your keywords ranked in the top 100, but Serper IS returning results.** "
+            "Open the **SERP Inspector** tab to see who's ranking for each keyword."
         )
 
+    # ============================================================
+    # ROW 1 — KPI strip
+    # ============================================================
     c1, c2, c3, c4 = st.columns(4)
-    c1.markdown(kpi_card("Visibility Index", f"{visibility}%",
-                         f"{top_10}/{total_kw} in top 10"), unsafe_allow_html=True)
-    c2.markdown(kpi_card("Top 3", str(top_3), "premium positions"),
+
+    # Average Position with delta vs previous scan
+    avg_val = f"{avg_pos:.1f}" if avg_pos is not None else "—"
+    avg_sub = _format_delta(avg_pos_delta, lower_is_better=True) if avg_pos_delta is not None else \
+              f"{len(ranked)} ranked of {total_kw}"
+    c1.markdown(kpi_card("Avg Position", avg_val, avg_sub), unsafe_allow_html=True)
+
+    # Search Visibility (top-10 share + breakdown)
+    visibility_pct = round(top_10 / total_kw * 100, 1) if total_kw else 0
+    vis_sub = (
+        f'<span style="color:#10b981;">Top 3: {top_3}</span> · '
+        f'<span style="color:#34d399;">Top 10: {top_10}</span> · '
+        f'<span style="color:#fbbf24;">Top 100: {top_100}</span>'
+    )
+    c2.markdown(kpi_card("Search Visibility", f"{visibility_pct}%", vis_sub),
                 unsafe_allow_html=True)
-    c3.markdown(kpi_card("Top 10", str(top_10), f"{top_20} in top 20"),
-                unsafe_allow_html=True)
-    c4.markdown(kpi_card("Avg Position", f"{avg_pos:.1f}" if avg_pos else "—",
-                         f"{len(ranked)} ranked of {total_kw}"),
+
+    # Keywords Up / Down counter (vs previous scan)
+    if previous_run:
+        ud_value = (
+            f'<span style="color:#10b981;">▲ {moved_up}</span> &nbsp; '
+            f'<span style="color:#ef4444;">▼ {moved_down}</span> &nbsp; '
+            f'<span style="color:#9ca3af;">— {same}</span>'
+        )
+        ud_sub = f"{new_kws} new" if new_kws else "vs previous scan"
+        c3.markdown(kpi_card("Keywords Up / Down", ud_value, ud_sub),
+                    unsafe_allow_html=True)
+    else:
+        c3.markdown(kpi_card("Keywords Up / Down", "—",
+                             "run again to see movement"), unsafe_allow_html=True)
+
+    # Indexed Pages (ranked keywords) with delta
+    indexed_delta = None
+    if previous_run:
+        prev_indexed = sum(1 for p in previous_run.values() if p <= 100)
+        indexed_delta = top_100 - prev_indexed
+    idx_sub = _format_delta(indexed_delta, lower_is_better=False) if indexed_delta is not None else \
+              f"{not_ranked} not ranked"
+    c4.markdown(kpi_card("Indexed Pages", str(top_100), idx_sub),
                 unsafe_allow_html=True)
 
     st.markdown("####")
 
-    st.markdown("##### Ranking Distribution")
-    dist = {
-        "1-3": top_3, "4-10": top_10 - top_3,
-        "11-20": top_20 - top_10,
-        "21-50": sum(1 for p in all_pos if 20 < p <= 50),
-        "51-100": sum(1 for p in all_pos if 50 < p <= 100),
-        "Not Ranked": total_kw - top_100,
-    }
-    bar_df = pd.DataFrame(list(dist.items()), columns=["Range", "Count"])
-    fig = px.bar(
-        bar_df, x="Range", y="Count", color="Range", text="Count",
-        color_discrete_sequence=["#10b981", "#34d399", "#fbbf24",
-                                  "#f59e0b", "#ef4444", "#9ca3af"],
-    )
-    fig.update_traces(textposition="outside")
-    fig.update_layout(
-        showlegend=False, margin=dict(l=0, r=0, t=10, b=0), height=320,
-        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-        xaxis_title="", yaxis_title="",
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    # ============================================================
+    # ROW 2 — Distribution donut + View Performance table
+    # ============================================================
+    left, right = st.columns([1, 1])
 
-    opps = df_res[(df_res["Position"] >= 4) & (df_res["Position"] <= 20)] \
-        .sort_values("Position")
+    with left:
+        st.markdown("##### Keyword Distribution")
+        dist = {
+            "Top 3": top_3,
+            "Top 10": top_10 - top_3,
+            "Top 100": top_100 - top_10,
+            "No rank": not_ranked,
+        }
+        donut_df = pd.DataFrame(
+            [(k, v) for k, v in dist.items() if v > 0],
+            columns=["Range", "Count"],
+        )
+        if not donut_df.empty:
+            color_map = {"Top 3": "#10b981", "Top 10": "#3b82f6",
+                         "Top 100": "#60a5fa", "No rank": "#4b5563"}
+            fig = px.pie(
+                donut_df, values="Count", names="Range", hole=0.65,
+                color="Range", color_discrete_map=color_map,
+            )
+            fig.update_traces(textinfo="value", textfont_size=14,
+                              hovertemplate="<b>%{label}</b><br>%{value} keywords<extra></extra>")
+            fig.update_layout(
+                margin=dict(l=0, r=0, t=10, b=0), height=280,
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                legend=dict(orientation="v", yanchor="middle", y=0.5,
+                            xanchor="left", x=1.05),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No keyword data yet.")
+
+    with right:
+        st.markdown("##### View Performance")
+        if previous_run:
+            st.caption(f"Movement vs scan from {st.session_state.previous_run_at or 'last run'}.")
+            perf_rows = [
+                {"View": "Keywords went up",   "Count": moved_up,
+                 "Avg Δ": _avg_delta(biggest_movers, sign=1)},
+                {"View": "Keywords went down",  "Count": moved_down,
+                 "Avg Δ": _avg_delta(biggest_movers, sign=-1)},
+                {"View": "Unchanged",           "Count": same,    "Avg Δ": "—"},
+                {"View": "New keywords",        "Count": new_kws,  "Avg Δ": "—"},
+            ]
+            st.dataframe(pd.DataFrame(perf_rows), use_container_width=True,
+                         hide_index=True, height=190)
+        else:
+            st.info("Run the tracker at least twice to see keyword movement here.")
+
+    # ============================================================
+    # ROW 3 — Competitor Performance
+    # ============================================================
+    st.markdown("##### Competitor Performance")
+    st.caption("Domains most often appearing in the top 10 across your tracked keywords, "
+               "and their average position. Your site is highlighted.")
+
+    target = get_root_domain(st.session_state.get("domain", ""))
+    competitor_rows = _aggregate_competitors(st.session_state.get("serp_cache") or {}, target)
+    if competitor_rows:
+        comp_df = pd.DataFrame(competitor_rows)
+        st.dataframe(
+            comp_df, use_container_width=True, hide_index=True,
+            height=min(420, 45 + 35 * len(comp_df)),
+            column_config={
+                "Site": st.column_config.TextColumn("Site", width="medium"),
+                "Appearances": st.column_config.NumberColumn(
+                    "Appearances",
+                    help="How many of your tracked keywords this domain ranks in (top 10).",
+                ),
+                "Avg Position": st.column_config.NumberColumn(
+                    "Avg Position", format="%.1f",
+                    help="Average position of this domain across the keywords it appears for.",
+                ),
+            },
+        )
+    else:
+        st.info("Top-10 competitor data will appear once a scan has completed.")
+
+    # ============================================================
+    # ROW 4 — Quick-Win Opportunities
+    # ============================================================
+    opps = df_res[(df_res["Position"] >= 4) & (df_res["Position"] <= 20)].sort_values("Position")
     if not opps.empty:
         st.markdown("##### 🎯 Quick-Win Opportunities")
-        st.caption("Positions 4–20 — closest to page 1 / top 3.")
+        st.caption("Keywords ranking in positions 4–20 — closest to page 1 / top 3.")
         st.dataframe(
             opps[["Keyword", "Rank", "URL", "Page Type", "Top Result"]],
             use_container_width=True, hide_index=True,
@@ -494,20 +720,14 @@ def render_intelligence(df_res):
 
     col_a, col_b = st.columns([3, 1])
     with col_a:
-        search = st.text_input("Search keywords",
-                               placeholder="Filter by keyword or URL…",
-                               label_visibility="collapsed")
+        search = st.text_input("Search keywords", placeholder="Filter by keyword or URL…", label_visibility="collapsed")
     with col_b:
-        rank_filter = st.selectbox(
-            "Position",
-            ["All", "Top 3", "Top 10", "Top 20", "21–100", "Not Ranked"],
-        )
+        rank_filter = st.selectbox("Position", ["All", "Top 3", "Top 10", "Top 20", "21–100", "Not Ranked"])
 
     df = df_res.copy()
     if search:
         s = search.lower()
-        df = df[df["Keyword"].str.lower().str.contains(s)
-                | df["URL"].fillna("").str.lower().str.contains(s)]
+        df = df[df["Keyword"].str.lower().str.contains(s) | df["URL"].str.lower().str.contains(s)]
     if rank_filter == "Top 3":
         df = df[df["Position"] <= 3]
     elif rank_filter == "Top 10":
@@ -519,7 +739,7 @@ def render_intelligence(df_res):
     elif rank_filter == "Not Ranked":
         df = df[df["Position"] > 100]
 
-    display_cols = ["Keyword", "Rank", "URL", "Page Type", "SERP Features", "Top Result"]
+    display_cols = ["Keyword", "Rank", "URL", "Page Type", "Top Result"]
     df_show = df[display_cols].sort_values(
         "Rank", key=lambda s: s.map(lambda v: int(v) if str(v).isdigit() else 999)
     )
@@ -531,14 +751,37 @@ def render_intelligence(df_res):
         column_config={
             "URL": st.column_config.LinkColumn("Your URL", width="medium"),
             "Top Result": st.column_config.TextColumn(
-                "Top Result", help="The #1 ranking domain in Google for this keyword."),
+                "Top Result", help="The #1 ranking domain in Google for this keyword."
+            ),
         },
     )
+
+    with st.expander("ℹ️ How are these ranks computed?"):
+        st.markdown(
+            "We mirror what a generic user in the selected country sees on Google:\n\n"
+            "- **Country-level only by default** (`gl=us`, `hl=en`). No `location` "
+            "hint, no autocorrect override — the broadest, most user-like SERP. "
+            "Add a city in **SERP Targeting → City-level Location** only if you "
+            "want results geo-targeted to a specific city.\n"
+            "- **Pure cumulative counter.** Rank = the Nth organic result "
+            "we've seen across all pages walked so far. No per-result "
+            "position-field heuristics (which are inconsistent across "
+            "Serper's paginated calls).\n"
+            "- **2-attempt fetch per page.** On a transient failure we retry "
+            "once with a 2s sleep before giving up on that page.\n"
+            "- **Walk every requested page.** Only an empty `organic` array "
+            "stops the walk early. Partial pages (7–9 results) are normal on "
+            "competitive SERPs and are not a signal to stop.\n"
+            "- **Subdomain-tolerant match.** `folio3.com` also matches "
+            "`agtech.folio3.com`, `blog.folio3.com`, etc.\n"
+            "- **Paginated walk.** Google deprecated `num=100`, so we walk "
+            "`page=1..N` with `num=10` and accumulate the full top-100 list."
+        )
 
 
 def render_serp_inspector(df_res):
     st.markdown("##### 🔬 SERP Inspector")
-    st.caption("Top 10 results Google actually returned for each keyword.")
+    st.caption("Pick any keyword to see Google's actual top 10 results.")
 
     cache = st.session_state.get("serp_cache") or {}
     if not cache:
@@ -552,7 +795,7 @@ def render_serp_inspector(df_res):
 
     competitors = cache.get(keyword, [])
     if not competitors:
-        st.warning("Serper returned zero organic results for this keyword.")
+        st.warning("Serper returned zero organic results for this keyword. Try changing device or location.")
         return
 
     rows = []
@@ -570,13 +813,11 @@ def render_serp_inspector(df_res):
 
     st.dataframe(
         pd.DataFrame(rows),
-        use_container_width=True, hide_index=True,
-        height=min(420, 45 + 38 * len(rows)),
+        use_container_width=True, hide_index=True, height=min(420, 45 + 38 * len(rows)),
         column_config={"URL": st.column_config.LinkColumn("URL", width="medium")},
     )
 
-    google_url = f"https://www.google.com/search?q={quote_plus(keyword)}&gl=us&pws=0&num=20"
-    st.link_button("🔗 Verify this SERP on Google", google_url)
+    st.link_button("🔗 Verify this SERP on Google", google_verify_url(keyword), use_container_width=False)
 
     if target and not found_target:
         st.info(f"`{target}` is **not in the top 10** for this keyword.")
@@ -584,116 +825,27 @@ def render_serp_inspector(df_res):
         st.success(f"✓ `{target}` appears in the top 10 for this keyword.")
 
 
-def render_debug():
-    st.markdown("##### 🐛 Raw Serper Debug")
-    st.caption("Exactly what Serper returned for each keyword — page-by-page. "
-               "Use this to verify whether Serper is reaching deep enough into "
-               "the SERP, or whether it's stopping early.")
-
-    debug = st.session_state.get("debug_data") or {}
-    if not debug:
-        st.info("Run a tracking session first.")
-        return
-
-    target = get_root_domain(st.session_state.get("domain", ""))
-    keyword = st.selectbox("Keyword", list(debug.keys()), key="debug_kw")
-    if not keyword:
-        return
-
-    pages = debug.get(keyword, [])
-    total_organics = sum(p.get("organic_count", 0) for p in pages)
-    pages_walked = len(pages)
-    found_at = None
-    for p in pages:
-        for u in p.get("urls", []) or []:
-            if domain_matches(u["url"], target):
-                found_at = u["cumulative"]
-                break
-        if found_at:
-            break
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Pages walked", pages_walked)
-    c2.metric("Organics returned", total_organics)
-    c3.metric("Target found at", str(found_at) if found_at else "—")
-    c4.metric("Search target", target or "—")
-
-    st.markdown("###### Per-page breakdown")
-    breakdown_rows = []
-    for p in pages:
-        if "error" in p:
-            breakdown_rows.append({
-                "Page": p["page"],
-                "Organics": "—",
-                "Range": "—",
-                "Status": f"❌ {p['error']}",
-            })
-            continue
-        urls = p.get("urls") or []
-        if urls:
-            rng = f"{urls[0]['cumulative']} – {urls[-1]['cumulative']}"
-        else:
-            rng = "—"
-        breakdown_rows.append({
-            "Page": p["page"],
-            "Organics": p.get("organic_count", 0),
-            "Range": rng,
-            "Status": "✓" if urls else "⚠️ empty",
-        })
-    st.dataframe(pd.DataFrame(breakdown_rows), use_container_width=True, hide_index=True)
-
-    if total_organics < 30:
-        st.warning(
-            f"⚠️ Serper returned only **{total_organics}** organic results "
-            f"across {pages_walked} pages. If your keyword's real position is "
-            f"deeper than this, the API didn't see it. This is a Serper.dev "
-            f"depth limitation — switching to DataForSEO or SerpAPI would "
-            f"reach further."
-        )
-
-    st.markdown("###### All URLs Serper saw (in order)")
-    flat = []
-    for p in pages:
-        for u in p.get("urls") or []:
-            is_you = domain_matches(u["url"], target)
-            flat.append({
-                "Position": u["cumulative"],
-                "Page": p["page"],
-                "Serper Pos (per-page)": u.get("serper_position", "—"),
-                "Domain": u["domain"] + (" 🟢 (you)" if is_you else ""),
-                "URL": u["url"],
-            })
-    if flat:
-        st.dataframe(
-            pd.DataFrame(flat), use_container_width=True, hide_index=True,
-            height=min(560, 45 + 35 * len(flat)),
-            column_config={"URL": st.column_config.LinkColumn("URL", width="medium")},
-        )
-    else:
-        st.warning("No organic results were returned for this keyword.")
-
-
 def render_exports(df_res):
     st.markdown("##### 📑 Export & Share")
-    csv = df_res.drop(columns=["Position", "Results Found"], errors="ignore") \
-                .to_csv(index=False).encode("utf-8")
+    csv = df_res.drop(columns=["Position", "Results Found"], errors="ignore").to_csv(index=False).encode("utf-8")
+
     domain_slug = st.session_state.domain.replace(".", "_") or "report"
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
     st.download_button("📥 CSV Report", data=csv,
                        file_name=f"{domain_slug}_rankings_{stamp}.csv",
-                       mime="text/csv", type="primary")
+                       mime="text/csv", type="primary", use_container_width=False)
 
 
 def main():
-    st.set_page_config(page_title="SERP Tracker Pro", page_icon="🎯",
-                       layout="wide", initial_sidebar_state="expanded")
+    st.set_page_config(page_title="SERP Tracker Pro", page_icon="🎯", layout="wide", initial_sidebar_state="expanded")
     init_session_state()
     render_styling()
 
     st.markdown(
         "<h1 style='margin-bottom:0'>🎯 SERP Tracker Pro</h1>"
         "<p style='opacity:0.65; margin-top:4px; font-size:0.95rem;'>"
-        "<span class='live-dot'></span>Real-time Google rank tracking</p>",
+        "<span class='live-dot'></span>Real-time Google rank tracking"
+        "</p>",
         unsafe_allow_html=True,
     )
 
@@ -714,14 +866,11 @@ def main():
                 depth=cfg["depth"],
             )
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
-        ["📊 Dashboard", "🔍 Keyword Intelligence", "🔬 SERP Inspector",
-         "🐛 Debug", "📑 Export"]
-    )
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 Dashboard", "🔍 Keyword Intelligence", "🔬 SERP Inspector", "📑 Export"])
 
     if not st.session_state.results_data:
         with tab1:
-            st.info("Configure the sidebar and click **Run Live Tracking**.")
+            st.info("Configure the sidebar and click **Run Live Tracking** to populate the dashboard.")
         return
 
     df_res = pd.DataFrame(st.session_state.results_data)
@@ -732,8 +881,6 @@ def main():
     with tab3:
         render_serp_inspector(df_res)
     with tab4:
-        render_debug()
-    with tab5:
         render_exports(df_res)
 
 
